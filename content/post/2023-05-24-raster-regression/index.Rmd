@@ -1,0 +1,397 @@
+---
+title: "趋势分析"
+author: "学R不思则罔"
+date: '2022-05-24'
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+thumbnail: "yga.png"
+categories: ["R"]
+tags: ["ols","ndvi","residual analysis"]
+description: "基于MODIS-NDVI数据、DEM及气象数据，辅以趋势分析、多元回归残差法、残差分析等方法，反演了XX地区time1—time2植被覆盖度及分析了其“格局—过程—趋势”的变化特征，探究了其对气候变化与人类活动的双重响应机制"
+toc: yes
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  comment = "#>",
+  tidy = F
+)
+```
+
+
+## 1.准备工作
+
+### 1.1加载扩展包
+
+```{r,warning=FALSE,message=FALSE}
+library(raster)
+library(terra)
+library(extrafont)
+library(showtext)
+library(tidyverse)
+library(tidyterra)
+library(ggspatial)
+library(sf)
+library(tictoc)
+```
+
+### 1.2 读取字体
+
+```{r,warning=FALSE,message=FALSE}
+showtext_auto(enable = TRUE)
+font_add("Times", "./font/Times New Roman.ttf")
+font_add("KaiTi", "./font/KaiTi.ttf")
+```
+
+### 1.3 读取数据
+
+```{r}
+lapply(X = list.files("D:/post/geography/raster/raster_regression/rawdata", full.names = TRUE), FUN = function(x) {
+  temp_file <- list.files(path = x, pattern = ".tif$", full.names = TRUE) %>%
+    raster::stack()
+  print(paste("====================栅格数据：", stringr::str_sub(names(temp_file)[1], 1, 3), "====================="))
+  print(temp_file)
+  print(paste("极大值：", cellStats(temp_file, stat = "max", na.rm = TRUE), "极小值：", cellStats(temp_file, stat = "min", na.rm = TRUE)))
+})
+```
+
+6个因子的数值范围正常，FVC因子和其他5个变量的范围不一致，因此需要后期掩膜提取
+
+
+## 2.数据处理
+
+### 2.1 矢量数据生成
+
+```{r}
+yga <- sf::read_sf("D:/post/geography/raster/raster_regression/data/粤港澳2020/县.shp")
+head(yga)
+```
+
+
+```{r}
+ggplot(yga) +
+  geom_sf(color = "black", size = 0.1) +
+  theme_light() +
+  theme(
+    plot.title = element_text(size = 20, hjust = 0.5, vjust = 0.5, face = "bold", family = "KaiTi"),
+    panel.border = element_rect(color = "black", size = 3),
+    axis.text.x = element_text(size = 14, hjust = 0.5, vjust = 0.5, face = "bold", family = "Times"),
+    axis.text.y = element_text(size = 14, hjust = 0.5, vjust = 0.5, face = "bold", family = "Times"),
+    axis.title.x = element_text(size = 14, hjust = 0.5, vjust = 0.5, face = "bold", family = "Times"),
+    axis.title.y = element_text(size = 14, hjust = 0.5, vjust = 0.5, face = "bold", family = "Times"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(title = "粤港澳大湾区地图") +
+  annotation_scale(location = "bl", width_hint = 0.3, text_family = "Times", text_cex = 1.5) +
+  annotation_north_arrow(
+    location = "tr", which_north = "false",
+    pad_x = unit(0.4, "cm"),
+    pad_y = unit(0.4, "cm"),
+    style = north_arrow_fancy_orienteering(
+      text_family = "Times"
+    )
+  )
+```
+
+### 2.2 栅格数据掩膜提取
+
+```{r}
+library(tictoc)
+tic()
+lapply(X = list.files("D:/post/geography/raster/raster_regression/rawdata", full.names = TRUE), FUN = function(x) {
+  paste0(x, "/", str_sub(string = x, start = nchar(x) - 2, end = nchar(x))) %>%
+    paste0(., 2001:2020, ".tif") %>%
+    as_tibble() %>%
+    set_names("new_file") %>%
+    mutate(import_file = purrr::map(.x = new_file, .f = function(x) {
+      ifelse(file.exists(x), x, str_remove(x, "new"))
+    })) %>%
+    unnest(cols = c(import_file)) %>%
+    dplyr::select(import_file) %>%
+    group_by(import_file) %>%
+    nest() %>%
+    mutate(new_raster = purrr::map(.x = import_file, .f = function(x) {
+      dir.create(paste0("D:/post/geography/raster/raster_regression/data/", str_sub(x, nchar(x) - 10, nchar(x) - 8)))
+      raster::brick(x) %>%
+        raster::crop(st_transform(yga, "+proj=aea +lat_0=0 +lon_0=105 +lat_1=25 +lat_2=47 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs")) %>%
+        mask(st_transform(yga, "+proj=aea +lat_0=0 +lon_0=105 +lat_1=25 +lat_2=47 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs")) %>%
+        projectRaster(crs = "+proj=longlat +datum=WGS84 +no_defs +type=crs") %>%
+        writeRaster(x = ., filename = str_remove(x, "raw") %>%
+          str_remove(., "new"), format = "GTiff", overwrite = TRUE)
+    }))
+})
+toc()
+```
+
+
+### 2.3 栅格数据重采样
+
+- 以SSD数据为基准进行重采样
+
+```{r}
+resample_temp <- list.files(path = "D:/post/geography/raster/raster_regression/data/SSD", pattern = ".tif$", full.names = TRUE)[1] %>%
+  raster::brick()
+resample_temp
+```
+
+- fvc全部数据重采样
+
+```{r}
+list.files(path = "D:/post/geography/raster/raster_regression/data/FVC", pattern = ".tif$", full.names = TRUE) %>%
+  as_tibble() %>%
+  set_names("new_file") %>%
+  group_by(new_file) %>%
+  nest() %>%
+  mutate(new_raster = purrr::map(.x = new_file, .f = function(x) {
+    raster::brick(x) %>%
+      resample(x = ., y = resample_temp, "bilinear") %>%
+      writeRaster(x = ., filename = x, format = "GTiff", overwrite = TRUE)
+  }))
+```
+
+
+## 3.趋势分析
+
+- 读取fvc栅格数据
+
+```{r}
+fvc_raster <- list.files(path = "D:/post/geography/raster/raster_regression/data/FVC", pattern = ".tif$", full.names = TRUE) %>%
+  raster::stack()
+fvc_raster
+```
+
+- 获取时间
+
+```{r}
+time <- 1:nlayers(fvc_raster)
+time
+```
+
+- 编写函数
+
+```{r}
+lm_wrapper <- function(x) {
+  # In case of any NA return four NA values for coefficient estimates
+  if (any(is.na(x))) {
+    return(rep(NA, 6))
+  }
+  # 建立模型
+  mod <- lm(x ~ time, na.action = na.omit)
+  # 获取系数值
+  coef <- summary(mod)$coefficients[1:2]
+  names(coef) <- c("Intercept", "X1")
+  # 获取p值
+  p_value <- summary(mod)$coefficients[, "Pr(>|t|)"]
+  names(p_value) <- c("Intercept_p", "X1_p")
+  # 获取拟合优度系数
+  r_squared <- summary(mod)$r.squared
+  names(r_squared) <- c("r_squared")
+  # 获取调整拟合优度系数
+  adj_r_squared <- summary(mod)$adj.r.squared
+  names(adj_r_squared) <- c("adj_r_squared")
+  # 获取残差
+  # resid <- summary(mod)$residuals
+  c(coef, p_value, r_squared, adj_r_squared)
+}
+```
+
+- 计算结果
+
+```{r}
+lm_terra <- terra::app(rast(fvc_raster), lm_wrapper)
+lm_terra
+```
+
+- 绘制四个变量图形
+
+```{r}
+ggplot() +
+  geom_spatraster(data = terra::subset(lm_terra, c("X1", "X1_p", "r_squared", "adj_r_squared"))) +
+  scale_fill_whitebox_c(
+    palette = "muted",
+    na.value = "white"
+  ) +
+  facet_wrap(~lyr) +
+  theme_light() +
+  theme(
+    plot.title = element_text(size = 20, hjust = 0.5, vjust = 0.5, face = "bold", family = "Times"),
+    plot.subtitle = element_text(size = 18, hjust = 0.5, vjust = 0.5, face = "bold", family = "Times"),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "bottom",
+    legend.text = element_text(family = "Times"),
+    legend.key.width = unit(2.5, "cm"),
+    legend.title = element_text(family = "Times")
+  ) +
+  labs(
+    fill = "value"
+  )
+```
+
+
+- 单独绘制slope
+
+```{r}
+ggplot() +
+  geom_spatraster(data = terra::subset(lm_terra, c("X1"))) +
+  scale_fill_whitebox_c(
+    palette = "muted",
+    na.value = "white"
+  )+
+  hrbrthemes::theme_modern_rc()
+```
+
+
+## 4.多元回归
+
+- 读取多个环境数据
+
+```{r}
+ef_terra <- list.files(path = "D:/post/geography/raster/raster_regression/data", full.names = TRUE) %>%
+  list.files(path = ., pattern = "tif$", full.names = TRUE) %>%
+  terra::rast()
+ef_terra
+```
+
+- 编写函数
+
+```{r}
+mlr_wrapper <- function(x) {
+  # In case of any NA return four NA values for coefficient estimates
+  if (any(is.na(x))) {
+    return(rep(NA, 14))
+  }
+  # 建立模型
+  mod <- lm(x[1:20] ~ x[21:40]+x[41:60]+x[61:80]+x[81:100]+x[101:120], na.action = na.omit)
+  # 获取系数值
+  coef <- summary(mod)$coefficients[1:6]
+  names(coef) <- c("Intercept", "PRE","RHU","SSD","TEM","WIN")
+  # 获取p值
+  p_value <- summary(mod)$coefficients[, "Pr(>|t|)"]
+  names(p_value) <- paste0(c("Intercept", "PRE","RHU","SSD","TEM","WIN"),"_p")
+  # 获取拟合优度系数
+  r_squared <- summary(mod)$r.squared
+  names(r_squared) <- c("r_squared")
+  # 获取调整拟合优度系数
+  adj_r_squared <- summary(mod)$adj.r.squared
+  names(adj_r_squared) <- c("adj_r_squared")
+  # 获取残差
+  # resid <- summary(mod)$residuals
+  c(coef, p_value, r_squared, adj_r_squared)
+}
+```
+
+- 计算结果
+
+```{r}
+tic()
+mlr_terra <- terra::app(ef_terra, mlr_wrapper,cores = 8)
+toc()
+```
+
+
+```{r}
+mlr_terra
+```
+
+- 绘制系数图
+
+```{r}
+ggplot() +
+  geom_spatraster(data = terra::subset(mlr_terra, 2:6)) +
+  scale_fill_whitebox_c(
+    palette = "muted",
+    na.value = "white"
+  ) +
+  facet_wrap(~lyr) +
+  theme_light() +
+  theme(
+    plot.title = element_text(size = 20, hjust = 0.5, vjust = 0.5, face = "bold", family = "Times"),
+    plot.subtitle = element_text(size = 18, hjust = 0.5, vjust = 0.5, face = "bold", family = "Times"),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "bottom",
+    legend.text = element_text(family = "Times"),
+    legend.key.width = unit(2.5, "cm"),
+    legend.title = element_text(family = "Times")
+  ) +
+  labs(
+    fill = "coefficients"
+  )
+```
+
+- 绘制系数P值图
+
+```{r}
+ggplot() +
+  geom_spatraster(data = terra::subset(mlr_terra, 8:12)) +
+  scale_fill_whitebox_c(
+    palette = "muted",
+    na.value = "white"
+  ) +
+  facet_wrap(~lyr) +
+  theme_light() +
+  theme(
+    plot.title = element_text(size = 20, hjust = 0.5, vjust = 0.5, face = "bold", family = "Times"),
+    plot.subtitle = element_text(size = 18, hjust = 0.5, vjust = 0.5, face = "bold", family = "Times"),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "bottom",
+    legend.text = element_text(family = "Times"),
+    legend.key.width = unit(2.5, "cm"),
+    legend.title = element_text(family = "Times")
+  ) +
+  labs(
+    fill = "P value"
+  )
+```
+
+- 绘制拟合优度
+
+```{r}
+ggplot() +
+  geom_spatraster(data = terra::subset(mlr_terra,13:14)) +
+  scale_fill_whitebox_c(
+    palette = "muted",
+    na.value = "white"
+  ) +
+  facet_wrap(~lyr) +
+  theme_light() +
+  theme(
+    plot.title = element_text(size = 20, hjust = 0.5, vjust = 0.5, face = "bold", family = "Times"),
+    plot.subtitle = element_text(size = 18, hjust = 0.5, vjust = 0.5, face = "bold", family = "Times"),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "bottom",
+    legend.text = element_text(family = "Times"),
+    legend.key.width = unit(2.5, "cm"),
+    legend.title = element_text(family = "Times")
+  ) +
+  labs(
+    fill = "value"
+  )
+```
+
+- 残差分析准备在下一篇推送写，思路同理。先得到每年的逐像元残差，然后拟合残差回归方程判断人类活动的影响
+
+----

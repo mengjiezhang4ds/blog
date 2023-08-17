@@ -1,0 +1,7 @@
+"0","lasso_hat_Y_fixT <- rc2df(r = T, c = N) %>%"
+"0","  left_join(rlist::list.rbind(res)) %>%"
+"0","  dplyr::arrange(c, r) %>%"
+"0","  pull(Y_fixT) %>%"
+"0","  matrix(data = ., nrow = T, ncol = N)"
+"1","[38;5;236mJoining with `by = join_by(r, c)`[39m
+"

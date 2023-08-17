@@ -1,0 +1,2 @@
+"0","cores <- detectCores(logical = FALSE)"
+"0","cl <- makeCluster(cores)"

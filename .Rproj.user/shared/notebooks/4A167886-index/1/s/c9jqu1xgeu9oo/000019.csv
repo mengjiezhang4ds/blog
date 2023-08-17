@@ -1,0 +1,13 @@
+"0","p_res <- ggplot() +"
+"0","  geom_spatraster(data = rast(MK_res)) +"
+"0","  facet_wrap(~lyr) +"
+"0","  scale_fill_whitebox_c("
+"0","    palette = ""muted"","
+"0","    na.value = ""white"""
+"0","  ) +"
+"0","  theme_light()"
+"0","p_res"
+"2","Registered S3 method overwritten by 'data.table':
+  method           from
+  print.data.table     
+"

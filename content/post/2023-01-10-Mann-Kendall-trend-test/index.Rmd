@@ -1,0 +1,168 @@
+---
+title: "Mann-Kendall trend test"
+author: "学R不思则罔"
+date: '2023-01-10'
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+categories: ["R"]
+tags: ["raster","ggplot2","Mann-Kendall trend test"]
+description: "基于**predicts**扩展包内嵌的**bio**系列数据，编写Mann-Kendall趋势检验函数，设定输入输出数据格式为栅格数据，对结果进行可视化展示"
+toc: true
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+- title         : Perform a Mann-Kendall trend test of satellite image time series
+- purpose       : Mann-Kendall test of monotonic trend and associated statistical significance
+- author        : Abdulhakim Abdi
+- input         : Raster stack/brick comprising a time series of observations
+- output        : Raster object of monotoic trend (Kendall's tau), significance or both (i.e. brick) 
+- data          : Test data: https://1drv.ms/u/s!AsHsKb_qtbkwg4ti8pJCxvUer9rMqg?e=BGcH1K
+- notes         : Depending on the time series, it is might be useful prewhiten the data to remove serial correlation 
+- CITATION: Abdi, A. M., et. al. (2019). First assessment of the plant phenology index (PPI) for estimating gross primary productivity in African semi-arid ecosystems. International Journal of Applied Earth Observation and Geoinformation,78,249-260.https://doi.org/10.1016/j.jag.2019.01.018 
+- code link     : https://gist.github.com/hakimabdi/7308bbd6d9d94cf0a1b8
+- blog          : See blog post on www.hakimabdi.com for more information. 
+
+## 1.加载扩展包
+
+```{r message=FALSE,warning=FALSE}
+library(predicts)
+library(raster)
+library(ggplot2)
+library(terra)
+library(tidyterra)
+library(Kendall)
+```
+
+## 2.编写函数
+
+```{r message=FALSE,warning=FALSE}
+MKraster <- function(rasterstack, type=c("trend","pval","both")){
+  
+  # Values for (layers, ncell, ncol, nrow, method, crs, extent) come straight from the input raster stack
+  # e.g. nlayers(rasterstack), ncell(rasterstack)... etc.
+  print(paste("Start MKraster:",Sys.time()))
+  print("Loading parameters")
+  layers=nlayers(rasterstack);ncell=ncell(rasterstack);
+  ncol=ncol(rasterstack);nrow=nrow(rasterstack);crs=crs(rasterstack);
+  extent=extent(rasterstack);pb = txtProgressBar(min = 0, max = ncell, initial = 0)
+  print("Done loading parameters")
+  mtrx <- as.matrix(rasterstack,ncol=layers)
+  empt <- matrix(nrow=ncell, ncol=2)
+  
+  print("Initiating loop operation")
+  if (type == "trend"){
+    
+    for (i in 1:length(mtrx[,1])){
+      if (all(is.na(mtrx[i,]))){ 
+        empt[i,1] <- NA 
+      } else 
+        if (sum(!is.na(mtrx[i,])) < 4){
+          empt[i,1] <- NA 
+        } else 
+          empt[i,1] <- as.numeric(MannKendall(as.numeric(mtrx[i,]))$tau)
+    }
+    
+    print("Creating empty raster")
+    trend <- raster(nrows=nrow,ncols=ncol,crs=crs)
+    extent(trend) <- extent
+    print("Populating trend raster")
+    values(trend) <- empt[,1]
+    print(paste("Ending MKraster on",Sys.time()))
+    trend
+  } 
+  else
+    if (type == "pval"){
+      
+      for (i in 1:length(mtrx[,1])){
+        if (all(is.na(mtrx[i,]))){ 
+          empt[i,1] <- NA 
+        } else 
+          if (sum(!is.na(mtrx[i,])) < 4){
+            empt[i,1] <- NA 
+          } else 
+            empt[i,1] <- as.numeric(MannKendall(as.numeric(mtrx[i,]))$sl)
+      }
+      
+      pval <- raster(nrows=nrow,ncols=ncol,crs=crs)
+      extent(pval) <- extent
+      print("Populating significance raster")
+      values(pval) <- empt[,1]
+      print(paste("Ending MKraster on",Sys.time()))
+      pval
+    }
+  else
+    if (type == "both"){
+      
+      for (i in 1:length(mtrx[,1])){
+        if (all(is.na(mtrx[i,]))){ 
+          empt[i,1] <- NA 
+        } else 
+          if (sum(!is.na(mtrx[i,])) < 4){
+            empt[i,1] <- NA 
+          } else 
+            tryCatch({
+              empt[i,1] <- as.numeric(MannKendall(as.numeric(mtrx[i,]))$tau)
+              empt[i,2] <- as.numeric(MannKendall(as.numeric(mtrx[i,]))$sl)
+            })
+      }
+      
+      tr <- raster(nrows=nrow,ncols=ncol,crs=crs)
+      pv <- raster(nrows=nrow,ncols=ncol,crs=crs)
+      print("Populating raster brick")
+      values(tr) <- empt[,1]
+      values(pv) <- empt[,2]
+      brk <- brick(tr,pv)
+      extent(brk) <- extent
+      names(brk) <- c("trend","p.value")
+      print(paste("Ending MKraster on",Sys.time()))
+      brk
+    }
+}
+```
+
+
+## 3.读取数据
+
+```{r message=FALSE,warning=FALSE}
+f <- system.file("ex/bio.tif", package="predicts")
+predictors <- stack(f)
+predictors
+```
+
+
+```{r message=FALSE,warning=FALSE}
+names(predictors)
+```
+
+## 4.检验趋势
+
+```{r message=FALSE,warning=FALSE}
+MK_res <- MKraster(rasterstack = predictors,type = "both")
+MK_res
+```
+
+
+```{r}
+p_res <- ggplot() +
+  geom_spatraster(data = rast(MK_res)) +
+  facet_wrap(~lyr) +
+  scale_fill_whitebox_c(
+    palette = "muted",
+    na.value = "white"
+  ) +
+  theme_light()
+p_res
+```
+
+```{r message=FALSE,warning=FALSE}
+library(plotly)
+ggplotly(p_res)
+```
+
+-------------

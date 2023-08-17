@@ -1,0 +1,239 @@
+---
+title: "purrr批量作图"
+author: "学R不思则罔"
+date: '2023-06-04'
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+thumbnail: "spei.gif"
+categories: ["R"]
+tags: ["ggplot2","purrr","gif"]
+description: "基于标准化降水蒸散指数数据，使用**ggplot2**扩展包展示，使用**purrr**扩展包批量绘制、存储，并且将结果展示为动态图"
+toc: yes
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  comment = "#>",
+  tidy = F
+)
+```
+
+
+## 1.加载扩展包
+
+```{r,warning=FALSE,message=FALSE}
+library(ncdf4)
+library(raster)
+library(terra)
+library(extrafont)
+library(showtext)
+library(tidyverse)
+library(tidyterra)
+library(ggspatial)
+```
+
+## 2.读取字体
+
+```{r}
+showtext_auto(enable = TRUE)
+font_add("Times", "./font/Times New Roman.ttf")
+font_add("KaiTi", "./font/KaiTi.ttf")
+```
+
+
+## 3.读取数据
+
+### 3.1 ncdf4读取
+
+```{r,echo=FALSE}
+spei_nc <- ncdf4::nc_open("D:/post/spei/outputNcdf/spei01.nc")
+```
+
+- 使用ncdf4的nc_open函数读取数据
+
+```{r,eval=FALSE}
+spei_nc <- ncdf4::nc_open("./outputNcdf/spei01.nc")
+```
+
+```{r}
+spei_nc
+```
+
+- 获取变量名
+
+```{r}
+names(spei_nc$var)
+```
+
+### 3.2 raster读取
+
+```{r,echo=FALSE}
+spei_stack <- raster::stack("D:/post/spei/outputNcdf/spei01.nc", varname = "spei")
+```
+
+- 使用raster的stack函数读取数据
+
+```{r,eval=FALSE}
+spei_stack <- raster::stack("./outputNcdf/spei01.nc", varname = "spei")
+```
+
+
+```{r}
+spei_stack
+```
+
+结果中的names自行添加了“X”使其成为字符串
+
+```{r}
+length(names(spei_stack)) / 12 == 122
+```
+
+spei01.nc文件的多个图层恰好是1901年到2022年每个月的数据
+
+- 草图展示
+
+```{r}
+spei_stack %>%
+  subset(1) %>%
+  plot()
+```
+
+```{r}
+spei_stack %>%
+  subset(1) %>%
+  raster::spplot()
+```
+
+
+### 3.3 terra读取
+
+
+```{r,echo=FALSE}
+spei_terra <- rast("D:/post/spei/outputNcdf/spei01.nc")
+```
+
+- 使用terra包的rast函数读取数据
+
+```{r,eval=FALSE}
+spei_terra <- rast("./outputNcdf/spei01.nc")
+```
+
+```{r}
+spei_terra
+```
+
+- tidyterra绘制草图
+
+```{r}
+ggplot() +
+  geom_spatraster(data = terra::subset(spei_terra, 1:4)) +
+  facet_wrap(~lyr) +
+  scale_fill_whitebox_c(
+    palette = "high_relief",
+    na.value = "white"
+  ) +
+  theme_light()
+```
+
+- 优化图片
+
+```{r}
+ggplot() +
+  geom_spatraster(data = terra::subset(spei_terra, 1)) +
+  scale_fill_whitebox_c(
+    palette = "muted",
+    na.value = "white",
+    limits = c(-4, 4)
+  ) +
+  theme_light() +
+  theme(
+    plot.title = element_text(size = 20, hjust = 0.5, vjust = 0.5, face = "bold", family = "Times"),
+    plot.subtitle = element_text(size = 18, hjust = 0.5, vjust = 0.5, face = "bold", family = "Times"),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "bottom",
+    legend.text = element_text(family = "Times"),
+    legend.key.width = unit(2.5, "cm"),
+    legend.title = element_text(family = "Times")
+  ) +
+  labs(
+    fill = "value",
+    caption = "DATA SOURCE:https://climatedataguide.ucar.edu/climate-data/standardized-precipitation-evapotranspiration-index-spei",
+    subtitle = lubridate::as_date(unlist(raster(terra::subset(spei_terra, 1))@z)),
+    title = "Standardized Precipitation Evapotranspiration Index"
+  ) +
+  annotation_scale(location = "bl", width_hint = 0.1)
+```
+
+## 4.批量绘图
+
+> [!Info]   
+> 这里仅仅绘制前12*10个月的数据(全数据跨度过大，不宜展示)
+
+```{r}
+tibble(id = 1:nlyr(spei_terra)) %>%
+  head(12*10) %>% 
+  group_by(id) %>%
+  nest() %>%
+  mutate(gg_fig = map(.x = id, .f = function(x) {
+    temp_data <- terra::subset(spei_terra, x)
+    p <- ggplot() +
+      geom_spatraster(data = temp_data) +
+      scale_fill_whitebox_c(
+        palette = "muted",
+        na.value = "white",
+        limits = c(-4, 4)
+      ) +
+      theme_light() +
+      theme(
+        plot.title = element_text(size = 20, hjust = 0.5, vjust = 0.5, face = "bold", family = "Times"),
+        plot.subtitle = element_text(size = 18, hjust = 0.5, vjust = 0.5, face = "bold", family = "Times"),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.ticks = element_blank(),
+        legend.position = "bottom",
+        legend.text = element_text(family = "Times"),
+        legend.key.width = unit(2.5, "cm"),
+        legend.title = element_text(family = "Times")
+      ) +
+      labs(
+        fill = "value",
+        caption = "DATA SOURCE:https://climatedataguide.ucar.edu/climate-data/standardized-precipitation-evapotranspiration-index-spei",
+        subtitle = lubridate::as_date(unlist(raster(terra::subset(spei_terra, x))@z)),
+        title = "Standardized Precipitation Evapotranspiration Index"
+      ) +
+      annotation_scale(location = "bl", width_hint = 0.1)
+
+    Fig_name <- paste0("./outputFig/", lubridate::as_date(unlist(raster(temp_data)@z)), ".jpg")
+    ggsave(p, filename = Fig_name, dpi = 100)
+    p
+  }))
+```
+
+## 5.动态图展示
+
+```{r}
+library(magick)
+list.files(path='./outputFig', pattern = '*.jpg', full.names = TRUE) %>%
+  image_read() %>%
+  image_join() %>% 
+  image_animate(fps=10) %>% 
+  image_write("spei.gif")
+```
+
+- 动态图展示如下
+
+![](spei.gif)
+

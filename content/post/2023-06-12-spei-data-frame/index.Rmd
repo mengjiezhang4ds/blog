@@ -1,0 +1,314 @@
+---
+title: "使用数据框数据计算SPEI"
+author: "学R不思则罔"
+date: '2023-06-12'
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+thumbnail: "station_time_series.jpg"
+categories: ["R"]
+tags: ["spei","ggplot2"]
+description: "基于降水和气温等数据框格式数据，使用**spei**扩展包计算潜在蒸散量、水平衡数据，最终计算**spei**数据，对结果可视化"
+toc: yes
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  comment = "#>",
+  tidy = F
+)
+```
+
+## 1.准备工作
+
+### 1.1加载扩展包
+
+```{r,warning=FALSE,message=FALSE}
+library(ncdf4)
+library(raster)
+library(terra)
+library(SPEI)
+library(extrafont)
+library(showtext)
+library(tidyverse)
+library(tidyterra)
+library(ggspatial)
+library(readxl)
+```
+
+### 1.2生成站点
+
+- 模拟生成90个观测站点经纬度信息
+
+```{r}
+pts_df <- tibble::tribble(
+  ~lon, ~lat,
+  26.25, 50.75,
+  155.75, 56.25,
+  -24.25, 74.25,
+  21.75, -30.25,
+  89.75, 42.75,
+  126.75, -27.75,
+  135.25, -1.75,
+  77.25, 67.25,
+  144.25, -4.25,
+  53.25, 61.25,
+  26.75, 26.75,
+  -61.25, -37.75,
+  74.75, 56.75,
+  145.75, 68.75,
+  7.75, 4.75,
+  136.25, 51.75,
+  -2.25, 39.25,
+  103.75, -5.25,
+  2.25, 23.75,
+  -120.75, 55.75,
+  -71.75, -2.75,
+  142.75, -13.75,
+  122.75, 13.75,
+  36.25, 0.25,
+  -126.25, 63.25,
+  108.25, 67.75,
+  100.75, 74.75,
+  77.25, 79.25,
+  26.25, 69.25,
+  -65.75, -36.25,
+  118.75, -22.25,
+  31.25, 20.75,
+  38.25, 35.25,
+  41.75, 31.75,
+  56.25, 80.25,
+  16.25, 69.25,
+  81.75, 68.75,
+  14.25, 36.25,
+  22.25, 8.75,
+  46.25, 42.75,
+  4.75, 16.75,
+  -70.25, 53.25,
+  -112.25, 37.25,
+  -83.75, 41.25,
+  -115.75, 34.75,
+  49.75, 11.25,
+  119.25, 67.75,
+  -67.75, 63.25,
+  -93.25, 62.25,
+  73.25, 65.75,
+  -25.25, 74.75,
+  -66.25, -21.75,
+  -108.25, 75.75,
+  -68.25, 67.25,
+  34.75, 45.25,
+  28.75, -16.75,
+  95.75, 44.25,
+  -59.75, -16.75,
+  94.75, 51.75,
+  19.75, 46.25,
+  9.25, 56.25,
+  -63.25, -15.75,
+  49.25, 47.25,
+  -106.25, 70.75,
+  147.25, -5.75,
+  -56.75, -14.75,
+  -89.25, 49.75,
+  -161.75, 68.25,
+  128.25, 48.25,
+  55.75, 74.25,
+  132.25, -3.25,
+  -115.25, 67.25,
+  36.75, 12.75,
+  17.25, -6.75,
+  33.75, 47.25,
+  -6.75, 53.75,
+  118.25, 37.25,
+  -100.75, 50.25,
+  -84.75, 45.75,
+  -110.25, 38.25,
+  179.25, 65.75,
+  93.25, 67.25,
+  145.25, -7.25,
+  161.75, 58.75,
+  -67.75, 66.25,
+  -81.25, 34.25,
+  -37.75, 82.25,
+  -72.75, 53.75,
+  37.75, -1.25,
+  97.25, 31.75
+)
+head(pts_df)
+```
+
+
+### 1.3提取数据
+
+- 提取温度数据得到**tmp_df**
+
+```{r,echo=FALSE}
+tmp_terra <- rast("D:/github/zmj/content/post/2023-06-02-spei/inputData/cru_ts4.07.1901.2022.tmp.dat.nc") %>%
+  terra::subset(1:(nlyr(.) / 2))
+```
+
+```{r,eval=FALSE}
+tmp_terra <- rast("./inputData/cru_ts4.07.1901.2022.tmp.dat.nc")
+```
+
+```{r}
+tmp_terra
+```
+
+```{r}
+tmp_df <- terra::extract(x = tmp_terra, y = pts_df, df = T) %>%
+  dplyr::select(-ID) %>%
+  t() %>%
+  as_tibble() %>%
+  setNames(paste0("station", 1:90)) %>%
+  mutate(
+    date = time(tmp_terra),
+    year = lubridate::year(date),
+    month = lubridate::month(date)
+  ) %>%
+  dplyr::select(date, year, month, everything())
+kableExtra::kable(head(tmp_df)[, 1:6])
+```
+
+- 提取温度数据得到**pre_df**
+
+```{r,echo=FALSE}
+pre_terra <- rast("D:/github/zmj/content/post/2023-06-02-spei/inputData/cru_ts4.07.1901.2022.pre.dat.nc") %>%
+  terra::subset(1:(nlyr(.) / 2))
+```
+
+```{r,eval=FALSE}
+pre_terra <- rast("./inputData/cru_ts4.07.1901.2022.pre.dat.nc")
+```
+
+```{r}
+pre_terra
+```
+
+```{r}
+pre_df <- terra::extract(x = pre_terra, y = pts_df, df = T) %>%
+  dplyr::select(-ID) %>%
+  t() %>%
+  as_tibble() %>%
+  setNames(paste0("station", 1:90)) %>%
+  mutate(
+    date = time(pre_terra),
+    year = lubridate::year(date),
+    month = lubridate::month(date)
+  ) %>%
+  dplyr::select(date, year, month, everything())
+kableExtra::kable(head(pre_df)[, 1:6])
+```
+
+- 观测站点保留纬度数据
+
+```{r}
+lat_df <- pts_df %>%
+  dplyr::select(-lon, lat) %>%
+  t() %>%
+  as.data.frame() %>%
+  setNames(paste0("station", 1:90))
+kableExtra::kable(head(lat_df[, 1:6]))
+```
+
+
+### 1.4 读取字体
+
+```{r,message=FALSE,warning=FALSE}
+showtext_auto(enable = TRUE)
+font_add("Times", "./font/Times New Roman.ttf")
+font_add("KaiTi", "./font/KaiTi.ttf")
+```
+
+
+## 2.计算SPEI
+
+### 2.1 计算pet
+
+- 采用thornthwaite方法计算pet
+
+```{r}
+th_apply <- lapply(X = 1:90, FUN = function(x) {
+  # 加3是因为要跳过dateyearmonth等时间变量
+  thornthwaite(tmp_df[, x + 3], lat_df[, x]) %>%
+    as.data.frame.array() %>%
+    as_tibble() %>%
+    setNames(colnames(lat_df)[x])
+})
+head(th_apply)
+```
+
+```{r}
+pet_res <- rlist::list.cbind(th_apply)
+head(pet_res)
+```
+
+### 2.2 计算水平衡
+
+```{r}
+waterbalance_res <- as.matrix(as.matrix(dplyr::select(pre_df, -date, -year, -month) - pet_res))
+head(waterbalance_res)
+```
+
+### 2.3 计算SPEI
+
+- 数据格式转变
+
+```{r}
+spei_apply <- lapply(X = 1:90, FUN = function(x) {
+  spei(waterbalance_res[, x], 1) %>%
+    .$fitted %>%
+    as_tibble() %>%
+    setNames(colnames(pet_res)[x])
+})
+```
+
+- 合并数据
+
+```{r}
+spei_res <- rlist::list.cbind(spei_apply) %>%
+  mutate(
+    date = pre_df$date,
+    year = pre_df$year,
+    month = pre_df$month
+  ) %>%
+  dplyr::select(date, year, month, everything())
+head(spei_res)
+```
+
+## 3.绘图展示
+
+```{r}
+spei_res %>% 
+  dplyr::select(date,station1:station6) %>% 
+  pivot_longer(-date,names_to = "station",values_to = "spei") %>% 
+  ggplot()+
+  geom_line(aes(date,spei))+
+  facet_wrap(~ station)+
+  theme_light() +
+  theme(
+    plot.title = element_text(size = 14, hjust = 0.5, vjust = 0.5, face = "bold", family = "Times"),
+    axis.text.x = element_text(family = "Times"),
+    axis.text.y = element_text(family = "Times"),
+    axis.title.x = element_text(family = "Times",size = 14),
+    axis.title.y = element_text(family = "Times",size = 14),
+    axis.ticks = element_blank(),
+    legend.position = "bottom",
+    legend.text = element_text(family = "Times"),
+    legend.key.width = unit(2.5, "cm"),
+    legend.title = element_text(family = "Times"),
+    strip.text = element_text(face = "bold",family = "Times",size = 12)
+  ) +
+  labs(
+    x = "date",
+    title = "Standardized Precipitation Evapotranspiration Index Of Different Stations"
+  )
+```
+
+----

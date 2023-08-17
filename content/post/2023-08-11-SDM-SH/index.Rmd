@@ -1,0 +1,2867 @@
+---
+title: "基于R语言caret包的上海市钉螺分布预测"
+author: "学R不思则罔"
+date: '2023-04-01'
+output:
+  html_document: default
+  pdf_document: default
+categories: ["R"]
+tags: ["tidyverse", "caret","SDM"]
+thumbnail: "rayshader.png"
+description: "使用caret框架实现上海市钉螺物种分布预测，包含数据点位栅格等读取处理绘图、模型建立分析绘图、未来分布预测等环节"
+toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  comment = "#>",
+  tidy = F
+)
+```
+
+## 1.准备工作
+
+### 1.1加载扩展包
+
+```{r}
+# 数据操作
+library(tidyverse)
+library(readxl)
+library(purrr)
+library(raster)
+library(terra)
+library(rayshader)
+library(sf)
+library(mapchina)
+library(dismo)
+# rmarkdown
+library(knitr)
+library(kableExtra)
+# 建模
+library(yardstick)
+library(pdp)
+library(gbm)
+library(xgboost)
+library(caret)
+library(creditmodel)
+# 绘图
+library(ggcor)
+library(tmap)
+library(cartomisc)
+library(plotly)
+library(gridExtra)
+# 设定Java内存
+# options(java.parameters = "-Xmx1000m")
+```
+
+### 1.2设定字体
+
+
+```{r message=FALSE,warning=FALSE}
+library(extrafont)
+library(showtext)
+showtext_auto(enable = TRUE)
+font_add("RMN", "./font/Times New Roman.ttf")
+font_add("KaiTi", "./font/KaiTi.ttf")
+```
+
+
+### 1.3导入数据
+
+#### 1.3.1 生成上海地图数据
+
+```{r}
+sh_sf <- mapchina::china %>%
+  dplyr::filter(Name_Province == "上海市") %>%
+  group_by(Name_Province) %>%
+  dplyr::summarise(geometry = st_union(geometry)) %>%
+  ungroup()
+
+sh_county_sf <- mapchina::china %>%
+  dplyr::filter(Name_Province == "上海市")
+
+p1 <- tm_shape(sh_county_sf) +
+  tm_borders()
+p2 <- tm_shape(sh_sf) +
+  tm_borders()
+# tmap::tmap_arrange(p1,p2)
+```
+
+#### 1.3.2 导入环境栅格数据
+
+```{r}
+ef_raster <- list.files(path = "./data", pattern = "asc$", full.names = T) %>%
+  stack()
+ef_terra <- list.files(path = "./data", pattern = "asc$", full.names = T) %>%
+  rast()
+```
+
+
+```{r}
+subset(ef_terra, c("ndvi20161", "ndvi20162", "ndvi20163", "ndvi20164")) %>%
+  rasterVis::levelplot()
+```
+
+
+```{r}
+# 定义函数并行绘图
+map_tmap <- function(value, raster) {
+  raster %>%
+    subset(value) %>%
+    tm_shape() +
+    tm_raster() +
+    tm_shape(sh_county_sf) +
+    tm_borders() +
+    tm_layout(
+      legend.title.size = .7,
+      legend.text.size = 0.5,
+      legend.outside = F,
+      legend.width = 0.5
+    )
+}
+
+# 执行并行绘图
+ef_tmap <- names(ef_raster) %>%
+  as_tibble() %>%
+  mutate(raster = list(ef_terra)) %>%
+  group_by(value) %>%
+  mutate(plot = map2(value, raster, map_tmap))
+
+# 18副图排4列
+do.call(tmap_arrange, c(ef_tmap$plot, ncol = 4))
+```
+
+其实这里就可以看出来上海市部分环境变量之间的差异非常不显著，毕竟面积大小限制在那里，自然环境多样性较低。这种影响体现在后续建模上有变量方差小，变化小，重要性低，变量`landcover`就是个例子
+
+
+-   上海环境数据
+
+```{r}
+env_df <- ef_raster %>%
+  as.data.frame(xy = T)
+kableExtra::kable(head(na.omit(env_df)))
+```
+
+#### 1.3.3 导入存在点数据
+
+
+- 同时提取环境数据
+
+```{r}
+# 添加注释是因为改用terra包重写以加快速度
+presence_df <- read_excel("./data/14—17上海某入侵物种调查.xlsx") %>%
+  # sf::st_as_sf(coords = c("x", "y"), crs = 4326) %>%
+  # raster::extract(x = ef_raster,y = .,df = T) %>%
+  dplyr::select(x, y) %>%
+  terra::extract(x = ef_terra, y = ., df = T) %>%
+  bind_cols(read_excel("./data/14—17上海某入侵物种调查.xlsx")) %>%
+  # dplyr::select(-ID) %>%
+  mutate(class = 1)
+```
+
+-   随机生成不存在点数据
+
+
+在上海市仅存在阳性点的区按照`1:10`比例使用随机抽样方法生成不存在点，并且同样提取环境数据
+
+> [!Note]   
+> <s>曾经尝试按照`1:3`比例使用随机抽样方法生成`270`个不存在点，效果好所以放弃</s>
+
+
+```{r}
+county_names <- read_excel("./data/14—17上海某入侵物种调查.xlsx") %>%
+  dplyr::select(didian) %>%
+  mutate(county = str_sub(didian, 5, 7)) %>%
+  pull(county) %>%
+  table() %>%
+  as.data.frame() %>%
+  setNames(c("county", "freq")) %>%
+  as_tibble()
+
+absence_pts <- sh_county_sf %>%
+  dplyr::filter(Name_County %in% county_names$county) %>%
+  group_by(Name_County) %>%
+  summarise(geometry = st_union(geometry)) %>%
+  ungroup() %>%
+  group_by(Name_County) %>%
+  nest() %>%
+  left_join(county_names, by = c("Name_County" = "county")) %>%
+  mutate(sample_pts = map2(.x = data, .y = freq, .f = function(x, y) {
+    st_sample(x = x, size = 10 * y) %>%
+      st_coordinates() %>%
+      as.data.frame() %>%
+      rename(x = X, y = Y)
+  })) %>%
+  dplyr::select(-data) %>%
+  ungroup() %>%
+  unnest(sample_pts) %>%
+  dplyr::select(x, y)
+
+absence_df <- absence_pts %>%
+  terra::extract(x = ef_terra, y = ., df = T) %>%
+  bind_cols(absence_pts) %>%
+  mutate(class = 0)
+```
+
+
+-   合并数据
+
+```{r}
+data_obs <- absence_df %>%
+  bind_rows(presence_df) %>%
+  dplyr::select(-x, -y, -didian) %>%
+  mutate(class = paste0("X", class)) %>%
+  mutate(across(.cols = class, .fns = as.factor)) %>%
+  na.omit() %>%
+  dplyr::select(-ID)
+kableExtra::kable(head(na.omit(data_obs)))
+```
+
+
+```{r}
+ggplot(data = sh_county_sf) +
+  geom_sf(fill = NA) +
+  geom_sf(
+    data = absence_df %>%
+      bind_rows(presence_df) %>%
+      mutate(class = ifelse(class == 0, "absence", "presence")) %>%
+      st_as_sf(coords = c("x", "y"), crs = 4326),
+    aes(color = class)
+  ) +
+  theme_light() +
+  labs(color = "") +
+  theme(legend.position = "bottom")
+```
+
+
+### 1.4 数据概览
+
+#### 1.4.1 数据摘要
+
+```{r}
+skimr::skim(data_obs)
+```
+
+#### 1.4.2 相关系数图
+
+```{r}
+data_obs %>%
+  dplyr::select_if(is.numeric) %>%
+  as.matrix() %>%
+  quickcor(cor.test = TRUE) +
+  geom_square(data = get_data(type = "lower", show.diag = FALSE)) +
+  geom_number(aes(num = r), size = 2.5, data = get_data(type = "upper", show.diag = FALSE)) +
+  geom_abline(intercept = 19, slope = -1, size = 0.8) +
+  scale_fill_gradientn(colours = c("#77C034", "white", "#C388FE"))
+```
+
+
+部分变量的相关性非常强
+
+#### 1.4.3 变量直方图
+
+```{r}
+data_obs %>%
+  dplyr::select_if(is.numeric) %>%
+  pivot_longer(everything(),
+    names_to = "vars",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(value, fill = vars)) +
+  geom_histogram(aes(value, fill = vars)) +
+  facet_wrap(~vars, scales = "free", nrow = 3) +
+  scale_y_continuous(name = "frequency") +
+  scale_x_continuous(name = "Continuous variables") +
+  labs(title = "Histogram of different variables") +
+  guides(fill = "none") +
+  scale_fill_viridis_d() +
+  theme_bw() +
+  theme(
+    plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+    text = element_text(size = 8, face = "bold", hjust = 0.5),
+    axis.title.y = element_text(face = "bold", hjust = 0.5),
+    axis.text.x = element_text(size = 6, face = "bold", angle = 30, hjust = 0.5, vjust = 0.5)
+  )
+```
+
+## 2.切分数据
+
+- 分层抽样(样本非平衡)
+
+```{r}
+set.seed(1111)
+train.index <- createDataPartition(data_obs$class, p = .7, list = FALSE)
+train <- data_obs[train.index, ]
+test <- data_obs[-train.index, ]
+
+whole_prop <- data_obs %>%
+  group_by(class) %>%
+  summarise(count = n()) %>%
+  mutate(prop = count / sum(count)) %>%
+  mutate(dataset = "whole_dataset") %>%
+  dplyr::select(dataset, everything())
+
+train_prop <- train %>%
+  group_by(class) %>%
+  summarise(count = n()) %>%
+  mutate(prop = count / sum(count)) %>%
+  mutate(dataset = "train_dataset") %>%
+  dplyr::select(dataset, everything())
+
+test_prop <- test %>%
+  group_by(class) %>%
+  summarise(count = n()) %>%
+  mutate(prop = count / sum(count)) %>%
+  mutate(dataset = "test_dataset") %>%
+  dplyr::select(dataset, everything())
+
+whole_prop %>%
+  bind_rows(train_prop) %>%
+  bind_rows(test_prop) %>%
+  mutate(across(prop, .fns = function(x) {
+    return(round(x, 2))
+  })) %>%
+  kable()
+```
+
+
+## 3.建立模型
+
+### 3.1SVM
+
+- 10折交叉验证，3次重复
+
+```{r}
+train_control <- trainControl(
+  method = "repeatedcv", number = 10,
+  repeats = 3, savePredictions = TRUE,
+  classProbs = TRUE
+)
+# metric="ROC"/metric="Kappa"
+svm_model <- train(class ~ .,
+  data = train, metric = "Kappa",
+  method = "svmRadial", trControl = train_control,
+  preProcess = c("center", "scale"), tuneLength = 10
+)
+svm_model
+```
+
+-   输出`Kappa`达到最大的模型参数
+
+```{r}
+svm_model$bestTune %>%
+  kable()
+```
+
+-   输出模型评价指标
+
+> [!info]  
+> 输出`acc`、`kappa`、`ROC`、`ppv`等指标
+
+```{r}
+metric_table <- function(model) {
+  temp_df <- model$pred %>%
+    as_tibble() %>%
+    dplyr::select(pred, obs, X0, X1, Resample) %>%
+    nest(data = c(pred, obs, X0, X1)) %>%
+    mutate(
+      acc = map(data, ~ accuracy_vec(.x$obs, .x$pred)),
+      kappa = map(data, ~ kap_vec(.x$obs, .x$pred)),
+      # ,options = list(smooth = TRUE)
+      ROC = map(data, ~ roc_auc_vec(.x$obs, .x$X0)),
+      ppv = map(data, ~ ppv_vec(.x$obs, .x$pred))
+    ) %>%
+    unnest(c(acc, kappa, ROC, ppv)) %>%
+    dplyr::select(-data)
+  return(temp_df)
+}
+```
+
+- 自定义cell_spec以强调指标最大值
+
+```{r}
+beautify_metric_table <- function(table) {
+  temp_df <- table
+
+  # 美化函数
+  my_cell_spec1 <- function(x) {
+    cell_spec(x,
+      "html",
+      color = ifelse(x == max(x),
+        "red",
+        "black"
+      ),
+      italic = ifelse(x == max(x),
+        TRUE,
+        FALSE
+      ),
+      bold = ifelse(x == max(x),
+        TRUE,
+        FALSE
+      ),
+      background = ifelse(x == max(x),
+        "grey",
+        "white"
+      ),
+      font_size = ifelse(x == max(x),
+        20,
+        15
+      )
+    )
+  }
+
+  # 美化表格
+  final_df <- temp_df %>%
+    mutate(across(where(is.numeric), .fns = function(x) round(x, 2))) %>%
+    mutate(across(.cols = where(is.numeric), my_cell_spec1)) %>%
+    kable("html", escape = FALSE) %>%
+    kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    kableExtra::kable_classic()
+
+  return(final_df)
+}
+metric_table(svm_model) %>%
+  beautify_metric_table(table = .)
+```
+
+-   混淆矩阵
+
+10折交叉验证并且重复三次的结果如下(因为是平均所以会有非整数)
+
+```{r}
+confusionMatrix.train(svm_model)
+```
+
+-   最优参数预测的混淆矩阵.
+
+```{r}
+confusionMatrix(data = predict(svm_model, train), reference = train$class)
+```
+
+-   变量重要性
+
+> [!Note]   
+>按照降序排列前若干个重要变量
+
+```{r}
+kable_var <- function(model, num) {
+  temp_df <- caret::varImp(model) %>%
+    .$importance %>%
+    dplyr::select(last_col()) %>%
+    rownames_to_column("variables") %>%
+    setNames(c("variables", "importance")) %>%
+    arrange(desc(importance)) %>%
+    rownames_to_column("id")
+
+  importance_threshold <- temp_df %>%
+    dplyr::filter(id == num) %>%
+    pull(importance)
+
+  # 辅助列上色
+  # 美化函数
+  my_cell_spec2 <- function(x) {
+    cell_spec(x,
+      "html",
+      color = ifelse(x >= importance_threshold,
+        "red",
+        "black"
+      ),
+      italic = ifelse(x >= importance_threshold,
+        TRUE,
+        FALSE
+      ),
+      bold = ifelse(x >= importance_threshold,
+        TRUE,
+        FALSE
+      ),
+      background = ifelse(x >= importance_threshold,
+        "grey",
+        "white"
+      ),
+      font_size = ifelse(x >= importance_threshold,
+        20,
+        15
+      )
+    )
+  }
+
+  final_df <- temp_df %>%
+    mutate(across(where(is.numeric), .fns = function(x) round(x, 4))) %>%
+    mutate(across(.cols = where(is.numeric), my_cell_spec2)) %>%
+    dplyr::select(-id) %>%
+    kable("html", align = "cr", escape = FALSE) %>%
+    kable_styling() %>%
+    kableExtra::kable_classic()
+
+  return(final_df)
+}
+kable_var(svm_model, 6)
+```
+
+这里按照降序绘制前若干个重要变量
+
+```{r}
+ggplot_var <- function(model, num) {
+  caret::varImp(model) %>%
+    .$importance %>%
+    dplyr::select(last_col()) %>%
+    rownames_to_column("variables") %>%
+    setNames(c("variables", "importance")) %>%
+    arrange(desc(importance)) %>%
+    rowid_to_column("rowid") %>%
+    mutate(group = case_when(
+      rowid > num ~ "B",
+      TRUE ~ "A"
+    )) %>%
+    ggplot(aes(x = reorder(variables, importance), importance, fill = group)) +
+    geom_col(alpha = 0.7, bins = 30) +
+    scale_x_discrete(name = "variables") +
+    scale_y_continuous(name = "importance") +
+    labs(title = "variable importance plot") +
+    guides(fill = "none") +
+    ggsci::scale_fill_lancet() +
+    theme_bw() +
+    coord_flip() +
+    theme(
+      plot.title = element_text(size = 14, hjust = 0.5, face = "bold"),
+      text = element_text(size = 10, hjust = 0.5),
+      axis.title.y = element_text(face = "bold", hjust = 0.5),
+      axis.text.x = element_text(size = 8, hjust = 0.5, vjust = 0.5),
+      axis.text.y = element_text(size = 8, hjust = 0.5, vjust = 0.5)
+    )
+}
+ggplot_var(svm_model, 6)
+```
+
+
+排名前六的变量分别是`im`、`pa`、`aridity`、`ndvi20162`、`ndvi20163`、`ndvi20163`
+
+-   partial dependence plots
+
+> [!info]  
+> 二维图形
+
+```{r}
+# 定义函数绘制pdp
+# 参数分别是模型、前X重要变量以为绘图时图片排列列数
+pdp_2d_one_predictor <- function(model, num, ncol) {
+  # 定义函数提取前若干重要变量
+  names_var <- function(model, num) {
+    des_var <- caret::varImp(model) %>%
+      .$importance %>%
+      dplyr::select(last_col()) %>%
+      rownames_to_column("variables") %>%
+      setNames(c("variables", "importance")) %>%
+      arrange(desc(importance)) %>%
+      rowid_to_column("rowid") %>%
+      head(num) %>%
+      pull(variables)
+    return(des_var)
+  }
+
+  # 重要变量名称
+  single_var <- names_var(model, num)
+
+  # p <- list()
+  # for (i in single_var) {
+  #   temp_var <- i
+  #   p[[i]] <- model %>%
+  #     partial(pred.var = temp_var,parallel = T) %>%
+  #     autoplot(smooth = TRUE, ylab = paste0("f(",temp_var,")")) +
+  #     theme_bw()+
+  #     scale_x_continuous(n.breaks = 8)+
+  #     theme(plot.title = element_text(size = 14,hjust = 0.5, face = "bold"),
+  #           text = element_text(size = 10,hjust = 0.5),
+  #           axis.title.y = element_text(face = "bold",hjust = 0.5),
+  #           axis.title.x = element_text(face = "bold",hjust = 0.5,vjust = 0.5))
+  # }
+  # do.call(grid.arrange, c(p, ncol = ncol))
+
+  # 定义pdp函数以搭配绘图
+  my_partial <- function(value, model) {
+    model %>%
+      partial(pred.var = value, parallel = T) %>%
+      autoplot(smooth = TRUE, ylab = paste0("f(", value, ")")) +
+      theme_bw() +
+      scale_x_continuous(n.breaks = 8) +
+      theme(
+        plot.title = element_text(size = 14, hjust = 0.5, face = "bold"),
+        text = element_text(size = 10, hjust = 0.5),
+        axis.title.y = element_text(face = "bold", hjust = 0.5),
+        axis.title.x = element_text(face = "bold", hjust = 0.5, vjust = 0.5)
+      )
+  }
+
+  # 执行pdp绘图函数
+  pdp_data <- single_var %>%
+    as_tibble() %>%
+    mutate(model = list(model)) %>%
+    group_by(value) %>%
+    mutate(plot = map2(value, model, my_partial))
+
+  # 组合图形
+  do.call(grid.arrange, c(pdp_data$plot, ncol = ncol))
+}
+pdp_2d_one_predictor(model = svm_model, num = 6, ncol = 2)
+```
+
+> In the above plot, please do not get confused with Y-axis. It does not show the predicted value instead how the value is changing with the change in the given predictor variable in our case Petal.Width in first plot.
+
+> In the plot if there are more variation for any given predictor variable that means the value of that variable affects the model quite alot but if the line is constant near zero it shows that variable has no affect on the model.
+
+> Single variables shows how there value affect the model, on y-axis having a negative value means for that particular value of predictor variable it is less likely to predict the correct class on that observation and having a positive value means it has positive impact on predicting the correct class. Same applies to two variable plots, color represent the intensity of affect on model.
+
+> [!info]  
+> 联合变量二维平面图形
+
+这里最开始是准备用`foreach`包并行计算的，但是其实数据量不大，所以并行计算多个模型即可，因为我们选择的是前六个重要的变量，组合起来是15个，所以并行计算输出`pdp`还是很有必要的！这里主要采用的是<s>lapply</s>purrr::map2，因为后者和ggplot2结合起来真的很方便！
+
+
+```{r}
+pdp_2d_two_predictor <- function(model, num, ncol) {
+  # 定义函数提取前若干重要变量
+  names_var <- function(model, num) {
+    des_var <- caret::varImp(model) %>%
+      .$importance %>%
+      dplyr::select(last_col()) %>%
+      rownames_to_column("variables") %>%
+      setNames(c("variables", "importance")) %>%
+      arrange(desc(importance)) %>%
+      rowid_to_column("rowid") %>%
+      head(num) %>%
+      pull(variables)
+    return(des_var)
+  }
+
+  # 所有排列组合情况
+  comb_var <- names_var(model, num = num) %>%
+    combn(., 2)
+
+  # 开启多线程
+  # library(parallel)
+  # no_cores <- detectCores() - 1
+  # library(foreach)
+  # library(doParallel)
+  # cl <- makeCluster(no_cores)
+  # registerDoParallel(cl)
+
+  # 绘图
+  # p <- list()
+  # for (i in 1:ncol(comb_var)) {
+  #   temp_var <- comb_var[,i]
+  #   p[[i]] <- model %>%
+  #     partial(pred.var = temp_var,
+  #             parallel = T,
+  #             chull = TRUE,
+  #             contour = TRUE,
+  #             contour.color = "red") %>%
+  #     autoplot(smooth = TRUE) +
+  #     theme_light() +
+  #     scale_x_continuous(n.breaks = 5)+
+  #     theme(plot.title = element_text(size = 14,hjust = 0.5, face = "bold"),
+  #           text = element_text(size = 8,hjust = 0.5),
+  #           axis.title.y = element_text(face = "bold",hjust = 0.5),
+  #           axis.title.x = element_text(face = "bold",hjust = 0.5,vjust = 0.5),
+  #           legend.position = "none")
+  # }
+
+  # 关闭多线程
+  # stopCluster(cl)
+
+  # 组合图形
+  # do.call(grid.arrange,c(p, ncol = ncol))
+
+  # 组合情况转为数据框
+  comb_df <- comb_var %>%
+    t() %>%
+    as_tibble()
+
+  # 针对map2函数设计pdp函数
+  my_partial <- function(V1, V2) {
+    model %>%
+      partial(
+        pred.var = c(V1, V2),
+        parallel = T,
+        chull = TRUE,
+        contour = TRUE,
+        contour.color = "red"
+      ) %>%
+      autoplot(smooth = TRUE) +
+      theme_light() +
+      scale_x_continuous(n.breaks = 5) +
+      theme(
+        plot.title = element_text(size = 14, hjust = 0.5, face = "bold"),
+        text = element_text(size = 8, hjust = 0.5),
+        axis.title.y = element_text(face = "bold", hjust = 0.5),
+        axis.title.x = element_text(face = "bold", hjust = 0.5, vjust = 0.5),
+        legend.position = "none"
+      )
+  }
+
+  # 执行pdp计算
+  pdp_data <- comb_df %>%
+    group_by(V1, V2) %>%
+    mutate(plot = map2(V1, V2, my_partial))
+
+  # 组合图形
+  do.call(grid.arrange, c(pdp_data$plot, ncol = ncol))
+}
+
+# 清除所有多线程任务
+# unregister_dopar <- function() {
+#   env <- foreach:::.foreachGlobals
+#   rm(list=ls(name=env), pos=env)
+# }
+
+# pdp_2d_two_predictor(model = svm_model,num = 6,ncol = 3)
+```
+
+
+颜色越浅，数值越大。
+
+> [!info]   
+> 联合变量三维立体图形
+
+由于三维立体图形无法使用静态图呈现，若全部使用`rgl`呈现则占用过多篇幅因此仅仅选择性展示`im`以及`ndvi20162`，因为这两个变量的*预测概率*分布范围更广，信息量大。
+
+```{r}
+# 定义函数提取前若干重要变量
+# names_var <- function(model,num){
+#   des_var <- caret::varImp(model) %>%
+#     .$importance %>%
+#     rownames_to_column("variables") %>%
+#     dplyr::select(variables,importance = X1) %>%
+#     setNames(c("variables","importance")) %>%
+#     arrange(desc(importance)) %>%
+#     rowid_to_column("rowid") %>%
+#     head(num) %>%
+#     pull(variables)
+#   return(des_var)
+# }
+#
+# # 所有排列组合情况
+# comb_var <- names_var(svm_model,num = 6) %>%
+#   combn(., 2)
+# temp_var <- comb_var[,3]
+#
+# gg_3D <- svm_model %>%
+#   partial(pred.var = temp_var,
+#           # parallel = T,
+#           chull = TRUE,
+#           contour = TRUE,
+#           contour.color = "red") %>%
+#   autoplot(smooth = TRUE) +
+#   theme_light() +
+#   scale_x_continuous(n.breaks = 5)+
+#   theme(plot.title = element_text(size = 14,hjust = 0.5, face = "bold"),
+#         text = element_text(size = 12,hjust = 0.5),
+#         axis.title.y = element_text(face = "bold",hjust = 0.5),
+#         axis.title.x = element_text(face = "bold",hjust = 0.5,vjust = 0.5))
+```
+
+-   静态图
+
+```{r}
+# par(mfrow = c(1, 2))
+# plot_gg(gg_3D, width = 5, height = 4, scale = 300, raytrace = FALSE, preview = TRUE)
+# plot_gg(gg_3D, width = 5, height = 4, scale = 300, multicore = TRUE, windowsize = c(1000, 800))
+# render_camera(fov = 70, zoom = 0.5, theta = 130, phi = 35)
+# Sys.sleep(2)
+# render_snapshot(clear = TRUE)
+```
+
+-   动态图
+
+```{r}
+# plot_gg(gg_3D, width = 5, height = 4, scale = 300, multicore = TRUE, windowsize = c(1000, 800))
+```
+
+-   预测测试集
+
+*caret*的指标合集函数`metric_set`存在问题，只好中途跳出来再进去
+
+```{r}
+metrics_set <- function(data) {
+  metric_row_df <- data %>%
+    summarise(
+      acc = accuracy_vec(obs, pred),
+      kap = kap_vec(obs, pred),
+      ppv = ppv_vec(obs, pred),
+      precision = precision_vec(obs, pred),
+      recall = recall_vec(obs, pred),
+      f_meas = f_meas_vec(obs, pred),
+      sensitivity = sensitivity_vec(obs, pred),
+      detection_prevalence = detection_prevalence_vec(obs, pred),
+      j_index = j_index_vec(obs, pred),
+      npv = npv_vec(obs, pred),
+      specificity = specificity_vec(obs, pred),
+      roc = roc_auc_vec(obs, X0),
+      mn_log_loss = mn_log_loss_vec(obs, X0),
+      pr_auc = pr_auc_vec(obs, X0)
+    ) %>%
+    mutate(tss = specificity + sensitivity - 1)
+
+  metric_col_df <- metric_row_df %>%
+    t() %>%
+    as.data.frame() %>%
+    rownames_to_column("metric") %>%
+    setNames(c("metric", "value"))
+
+  return(metric_col_df)
+}
+```
+
+> [!info]  
+> 使用一套预测指标对模型在测试集上的表现进行评估，其中有的是针对二分类预测结果，有的是针对概率预测结果，有的指标是越大越好，有的反之，具体如上表所示。
+
+```{r}
+extractProb(list(svm_model), testX = test) %>%
+  metrics_set(data = .) %>%
+  kable("html", align = "cr", escape = FALSE) %>%
+  kable_styling() %>%
+  kableExtra::kable_classic()
+```
+
+
+-   预测上海市
+
+```{r}
+# 速度确实快但是少了很多样本
+# extractProb(list(svm_model), testX = env_df)
+# extractProb(list(svm_model), testX = env_df)
+```
+
+这个地方存疑
+
+```{r}
+# svm_pred_bin <- predict(svm_model, newdata = env_df,type = "prob")
+#
+# svm_pred_prob <- predict(svm_model, newdata = env_df,type = "raw")
+#
+# svm_pred_df <- env_df %>%
+#   na.omit() %>%
+#   bind_cols(svm_pred_bin) %>%
+#   bind_cols(tibble(pred = svm_pred_prob))
+
+# 定义函数整合输出概率值与分类值
+pred_df <- function(model) {
+  env_df %>%
+    na.omit() %>%
+    bind_cols(model %>%
+      predict(
+        object = .,
+        newdata = env_df,
+        type = "prob"
+      )) %>%
+    bind_cols(tibble(pred = model %>%
+      predict(
+        object = .,
+        newdata = env_df,
+        type = "raw"
+      )))
+}
+
+# 定义函数以整合输出多个栅格数据
+pred_layer <- function(pred_df_res, model, model.name) {
+  # 添加多步判断语句-----主要为后续建模预测结果整合的傻瓜化输出考虑
+  if (length(colnames(pred_df_res)) >= 5) {
+    print("数据中变量个数符合要求")
+  } else {
+    stop("数据中变量个数不符合要求")
+  }
+
+  if (length(as.character.factor(unique(pred_df_res$pred))) == 2) {
+    print("数据中分类变量是二值型")
+  } else {
+    stop("数据中分类变量不是二值型")
+  }
+
+  if (length(unique(pred_df_res$pred)) == 2) {
+    print("数据中二分类变量种类符合要求")
+  } else {
+    stop("数据中二分类变量种类符合要求")
+  }
+
+  if (min(pred_df_res$X1) >= 0 & max(pred_df_res$X1) <= 1) {
+    print("数据中预测概率值变量范围符合要求")
+  } else {
+    stop("数据中预测概率值变量范围不符合要求")
+  }
+
+  if (is.character(model.name)) {
+    print("模型名称符合要求")
+  } else {
+    stop("你需要提供一个字符串作为栅格数据图层名称！")
+  }
+
+
+  # 二分类数据转换
+  temp_pred_bin_layer <-
+    pred_df_res %>%
+    dplyr::select(x, y, z = pred) %>%
+    # 从原来因子型转换为数值型
+    mutate(z = ifelse(z == "X0", 0, 1)) %>%
+    data.matrix() %>%
+    rasterFromXYZ()
+
+  # 重命名
+  names(temp_pred_bin_layer) <- paste0(model.name, "_bin")
+
+  # 指定crs
+  crs(temp_pred_bin_layer) <- "+proj=longlat +datum=WGS84 +no_defs +type=crs"
+
+  if (dir.exists("./data/pred/caret")) {
+    print("Path `./data/pred/caret` already exist!")
+  } else {
+    dir.create("./data/pred/caret")
+    print("Path `./data/pred/caret` newly create!")
+  }
+
+  # 保存图层
+  temp_pred_bin_layer %>%
+    writeRaster(paste0("./data/pred/caret/", names(temp_pred_bin_layer), ".tif"),
+      overwrite = TRUE
+    )
+
+  # 概率值数据转换
+  temp_pred_prob_layer <-
+    pred_df_res %>%
+    dplyr::select(x, y, z = X1) %>%
+    data.matrix() %>%
+    rasterFromXYZ()
+
+  # 重命名
+  names(temp_pred_prob_layer) <- paste0(model.name, "_prob")
+
+  # 指定crs
+  crs(temp_pred_prob_layer) <- "+proj=longlat +datum=WGS84 +no_defs +type=crs"
+
+  # 保存图层
+  temp_pred_prob_layer %>%
+    writeRaster(paste0("./data/pred/caret/", names(temp_pred_prob_layer), ".tif"),
+      overwrite = TRUE
+    )
+
+  # 叠加数据并且输出
+  res <- temp_pred_bin_layer %>%
+    stack(temp_pred_prob_layer)
+  return(res)
+}
+
+sh_pred_layer <- pred_df(model = svm_model) %>%
+  pred_layer(
+    pred_df_res = .,
+    model = svm_model,
+    model.name = "svm"
+  )
+sh_pred_layer
+```
+
+结果是符合我们要求的
+
+-   上海市结果可视化
+
+主要使用`tmap`、`plotly`、<s>`ggplot2`</s>(速度太慢)等扩展包展示
+
+```{r}
+# 定义函数分开展示二分类和概率值两个栅格图层
+sh_tmap <- function(data) {
+  # 前期全部是二分类基础上叠加的概率值栅格数据
+  names(data) <- c("binary", "probility")
+  temp_layer <- subset(data, 2)
+
+  sh_county_sf <- mapchina::china %>%
+    dplyr::filter(Name_Province == "上海市")
+
+  t2 <- tm_shape(sh_county_sf) +
+    tm_borders("black", alpha = .5) +
+    tm_shape(temp_layer) +
+    tm_raster(
+      breaks = c(0, .33, .66, .9, 1),
+      # 给定空字符串以设置为无
+      # title = "适宜度 \n Habitat \n suitability",
+      title = "",
+      # labels = c("Lost", "Pres", "Abs","Gain"),
+      palette = c("#FFFFFF", "#A6D186", "#F2AB71", "#B71D20")
+    ) +
+    tm_facets(free.scales = FALSE, nrow = 1) +
+    tm_shape(sh_county_sf) +
+    tm_borders("black", alpha = .5) +
+    # tm_style(style = "classic") +
+    # 添加图例
+    tm_legend(legend.position = c("left", "top"), outside = FALSE) +
+    # 添加比例尺
+    tm_scale_bar(position = c("left", "bottom"), text.size = 0.7) +
+    # 添加指南针
+    tm_compass(
+      position = c("right", "bottom"), size = 2.5,
+      type = "rose"
+    ) +
+    # 静态图形式
+    tmap_mode(mode = "plot") +
+    # 设定图片边界
+    tm_layout(
+      title = "",
+      title.fontfamily = "RMN",
+      legend.title.fontfamily = "RMN",
+      legend.text.fontfamily = "RMN",
+      bg.color = "white",
+      title.size = 1,
+      legend.title.size = 1.5,
+      legend.text.size = 1.2,
+      legend.width = 0.3,
+      title.fontface = "bold",
+      # legend.title.fontface = "italic",
+      title.position = c("center", "top"),
+      inner.margins = c(.02, .15, .06, .15),
+      panel.labels = names(temp_layer),
+      panel.label.size = 1.5,
+      panel.label.fontfamily = "RMN"
+    )
+
+  temp_layer <- subset(data, 1)
+
+  t1 <- tm_shape(sh_county_sf) +
+    tm_borders("black", alpha = .5) +
+    tm_shape(temp_layer) +
+    tm_raster(
+      breaks = c(0, 0.5, 1),
+      # 给定空字符串以设置为无
+      # title = "适宜度 \n Habitat \n suitability",
+      title = "",
+      labels = c("absence", "presence"),
+      palette = c("#FFFFFF", "#B71D20")
+    ) +
+    tm_facets(free.scales = FALSE, nrow = 1) +
+    tm_shape(sh_county_sf) +
+    tm_borders("black", alpha = .5) +
+    # tm_style(style = "classic") +
+    # 添加图例
+    tm_legend(legend.position = c("left", "top"), outside = FALSE) +
+    # 添加比例尺
+    tm_scale_bar(position = c("left", "bottom"), text.size = 0.7) +
+    # 添加指南针
+    tm_compass(
+      position = c("right", "bottom"), size = 2.5,
+      type = "rose"
+    ) +
+    # 静态图形式
+    tmap_mode(mode = "plot") +
+    # 设定图片边界
+    tm_layout(
+      title = "",
+      title.fontfamily = "RMN",
+      legend.title.fontfamily = "RMN",
+      legend.text.fontfamily = "RMN",
+      bg.color = "white",
+      title.size = 1,
+      legend.title.size = 1.5,
+      legend.text.size = 1.2,
+      legend.width = 0.3,
+      title.fontface = "bold",
+      # legend.title.fontface = "italic",
+      title.position = c("center", "top"),
+      inner.margins = c(.02, .15, .06, .15),
+      panel.labels = names(temp_layer),
+      panel.label.size = 1.5,
+      panel.label.fontfamily = "RMN"
+    )
+
+  # 组合图形
+  res <- tmap::tmap_arrange(t1, t2)
+  return(res)
+}
+
+sh_tmap(sh_pred_layer)
+```
+
+-   展示3D图尝试1
+
+花了一下午时间，真心累啊，<s>来不及发邮件了</s>，只想问问`plotly`开发团队，为什么*z*必须是个矩阵，太不人性！
+
+```{r}
+# axi_lv <- function(data,breaks){
+#   # 判断数据类型
+#   if (nlayers(data) == 1) {
+#     print("数据格式符合要求")
+#   }else{
+#     stop("你需要提供栅格数据以进行下一步操作！")
+#   }
+#
+#   # 转换为矩阵数据
+#   temp_mat <- data %>%
+#     as.data.frame(xy = T) %>%
+#     setNames(c("x","y","z")) %>%
+#     mutate(z = z*100) %>%
+#     pivot_wider(names_from = y,values_from = z) %>%
+#     as.matrix.data.frame()
+#
+#   # 切分坐标轴并且赋予标签
+#
+#   # 纬度范围
+#   lat_range <- raster::bbox(data)[2,]
+#   # 感性理解----多少条纬线
+#   x.value <- seq(1,ncol(temp_mat),length.out = breaks)
+#   # 标签个数
+#   x.label <- rev(seq(min(lat_range),max(lat_range),length.out = breaks)) %>%
+#     round(2) %>%
+#     paste0(.,"\u00B0E")
+#
+#   # 经度范围
+#   long_range <- raster::bbox(data)[1,]
+#   # 感性理解----多少条经线
+#   y.value <- seq(1,nrow(temp_mat),length.out = breaks)
+#   # 标签个数
+#   y.label <- rev(seq(min(long_range),max(long_range),length.out = breaks)) %>%
+#     round(2) %>%
+#     paste0(.,"\u00B0N")
+#
+#   return(list(mat.data = temp_mat,
+#               x.value = x.value,
+#               x.label = x.label,
+#               y.value = y.value,
+#               y.label = y.label))
+# }
+#
+# plotly.detail <- axi_lv(sh_pred_layer$svm_prob,5)
+#
+# plot_ly(z = ~plotly.detail$mat.data) %>%
+#   add_surface(contours = list(
+#     z = list(
+#       show=TRUE,
+#       usecolormap=TRUE,
+#       highlightcolor="#ff0000",
+#       project=list(z=TRUE)
+#       )
+#     )) %>%
+#   layout(
+#     title = "3D map of snail infection risk in Shanghai",
+#     scene = list(
+#       xaxis = list(title = "latitude",
+#                    tickvals = plotly.detail$x.value,
+#                    ticktext = plotly.detail$x.label),
+#       yaxis = list(title = "longitude",
+#                    tickvals = plotly.detail$y.value,
+#                    ticktext = plotly.detail$y.label),
+#       zaxis = list(title = "probability"),
+#       camera=list(
+#         # eye = list(x=1.87, y=0.88, z=-0.64)
+#         )
+#     ))
+```
+
+经纬度看着还行，其实一点用没有，交互式展现的全是栅格数据转成矩阵时候，矩阵的行列数<s>属实有点尴尬</s>
+  
+  -   展示3D图尝试2
+
+```{r}
+# cartomisc::gplot_data(sh_pred_layer$svm_prob) %>%
+#   dplyr::select(x,y,z = value) %>%
+#   mutate(probability = z) %>%
+#   plot_ly(
+#     x = ~x,
+#     y = ~y,
+#     z = ~z,
+#     size = ~z,
+#     color = ~probability
+#   ) %>%
+#   layout(
+#     title = "3D map of snail infection risk in Shanghai",
+#     scene = list(
+#       xaxis = list(title = "longitude"),
+#       yaxis = list(title = "latitude"),
+#       zaxis = list(title = "probability"),
+#       # camera = list(eye = list(x = 0, y = -1, z = 0.5)),
+#       aspectratio = list(x = 0.9, y = 0.8, z = 1)
+#     ))
+```
+
+
+这图看起来虽然不是很平滑，但是起码还能结合经纬度理解理解，半斤八俩吧，这个是真*八俩*<s>十六进制</s>十进制的八俩！
+
+-   展示3D图尝试3
+
+抓住`plotly`绘制`3D`图的核心思想是建立矩阵数据
+
+```{r}
+# # 从小到大
+# y <- sh_pred_layer$svm_prob %>%
+#   as.data.frame(xy = T) %>%
+#   pull(x) %>%
+#   unique()
+# # 从大到小
+# x <- sh_pred_layer$svm_prob %>%
+#   as.data.frame(xy = T) %>%
+#   pull(y) %>%
+#   unique()
+# # 按照行顺序从左到右取值
+# z <- sh_pred_layer$svm_prob %>%
+#   getValues()
+# dim(z) <- c(length(y),length(x))
+# probability <- z
+#
+# # 元素凑齐
+# plot_ly(
+#   type = 'surface',
+#   contours = list(
+#     x = list(show = TRUE,
+#              # start = 1.5,
+#              # end = 2,
+#              size = 0.04, color = 'white'),
+#     z = list(show = TRUE,
+#              # start = 0.5,
+#              # end = 0.8,
+#              size = 0.05,
+#              show=TRUE,
+#              usecolormap=TRUE,
+#              highlightcolor="#ff0000",
+#              project=list(z=TRUE))),
+#   x = ~x,
+#   y = ~y,
+#   z = ~z,
+#   color = ~probability) %>%
+#   layout(
+#     title = "3D map of snail infection risk in Shanghai",
+#     scene = list(
+#       xaxis = list(title = "latitude",autorange = "reversed"),
+#       yaxis = list(title = "longitude"),
+#       zaxis = list(title = "probability"),
+#       aspectratio = list(x = .9, y = .8, z = 0.8)
+#       # camera=list(
+#       #   # eye = list(x=1.87, y=0.88, z=-0.64)
+#       #   )
+#   ))
+
+# 打包函数
+sh_plotly <- function(data, model.name) {
+  # 判断数据类型
+  if (nlayers(data) == 1) {
+    print("数据格式符合要求")
+  } else {
+    stop("你需要提供栅格概率预测值数据以进行下一步操作！")
+  }
+
+  # 判断数据类型
+  if (is.character(model.name)) {
+    print("模型名称符合要求")
+  } else {
+    stop("你需要提供模型名称以搭配显示图表题！")
+  }
+
+  # 从小到大
+  y <- data %>%
+    as.data.frame(xy = T) %>%
+    pull(x) %>%
+    unique()
+  # 从大到小
+  x <- data %>%
+    as.data.frame(xy = T) %>%
+    pull(y) %>%
+    unique()
+  # 按照行顺序从左到右取值
+  z <- data %>%
+    getValues()
+  dim(z) <- c(length(y), length(x))
+  probability <- z
+
+  # 元素凑齐
+  plot_ly(
+    type = "surface",
+    contours = list(
+      x = list(
+        show = TRUE,
+        # start = 1.5,
+        # end = 2,
+        size = 0.04, color = "white"
+      ),
+      z = list(
+        show = TRUE,
+        # start = 0.5,
+        # end = 0.8,
+        size = 0.05,
+        show = TRUE,
+        usecolormap = TRUE,
+        highlightcolor = "#ff0000",
+        project = list(z = TRUE)
+      )
+    ),
+    x = ~x,
+    y = ~y,
+    z = ~z,
+    color = ~probability
+  ) %>%
+    layout(
+      title = paste0(toupper(model.name), ":3D map of snail infection risk in Shanghai"),
+      scene = list(
+        xaxis = list(title = "latitude", autorange = "reversed"),
+        yaxis = list(title = "longitude"),
+        zaxis = list(title = "probability"),
+        aspectratio = list(x = .9, y = .8, z = 0.8)
+        # camera=list(
+        #   # eye = list(x=1.87, y=0.88, z=-0.64)
+        #   )
+      )
+    )
+}
+# sh_plotly(data = sh_pred_layer$svm_prob,model.name = "svm")
+```
+
+
+尝试十几次，尝试方向主要集中在调整`x`、`y`、`z`三个坐标轴的顺序(利用`rev`函数实现)，然后在[stackoverflow](whttps://stackoverflow.com/questions/40643288/how-to-reverse-axis-values-when-using-plotly)检索到参数`autorange = "reversed"`，<s>耐心调试几次</s>竟然误打误撞实现了！
+
+-   展示3D图尝试4
+
+```{r}
+library(rayshader)
+sh_rayshader <- function(data) {
+  
+  ggvolcano <- data %>%
+    as.data.frame(xy = T) %>%
+    setNames(c("x", "y", "value")) %>%
+    ggplot() +
+    geom_tile(aes(x = x, y = y, fill = value)) +
+    scale_x_continuous("longitude") +
+    scale_y_continuous("latitude") +
+    scale_fill_gradientn("probability", colours = terrain.colors(10)) +
+    coord_fixed()
+
+  plot_gg(ggvolcano,
+    multicore = FALSE, raytrace = TRUE, width = 7, height = 4,
+    scale = 300, windowsize = c(1400, 866), zoom = 0.6, phi = 30, theta = 30
+  )
+  
+  Sys.sleep(0.2)
+
+  render_snapshot(clear = TRUE)
+}
+sh_rayshader(data = sh_pred_layer$svm_prob)
+```
+
+
+
+对比上述几张图，明显最后一张图效果最好，因此接下来的模型预测都是在此基础上用打包好的函数绘图。
+
+
+### 3.2 RF
+
+-   10折交叉验证，3次重复
+
+```{r}
+# library(doParallel)
+# cores <- makeCluster(detectCores() - 1)
+# registerDoParallel(cores = cores)
+# set.seed(1111)
+```
+
+Create control function for training with 10 folds and keep 3 folds for training. search method is grid.
+
+```{r}
+control <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 3,
+  search = "grid",
+  savePredictions = TRUE,
+  classProbs = TRUE
+)
+```
+
+Create tunegrid with 15 values from 1:15 for mtry to tunning model. Our train function will change number of entry variable at each split according to tunegrid.
+
+```{r}
+tunegrid <- expand.grid(.mtry = (1:15))
+
+rf_model <- train(class ~ .,
+  data = train,
+  method = "rf",
+  metric = "Kappa",
+  trControl = control,
+  tuneGrid = tunegrid
+)
+rf_model
+```
+
+-   输出`Kappa`达到最大的模型参数
+
+```{r}
+rf_model$bestTune %>%
+  kable()
+```
+
+-   输出模型评价指标
+
+> [!Info]
+> 输出`acc`、`kappa`、`ROC`、`ppv`等指标
+
+```{r}
+metric_table(rf_model) %>%
+  beautify_metric_table(table = .)
+```
+
+-   混淆矩阵
+
+10折交叉验证并且重复三次的结果如下(因为是平均所以会有非整数)
+
+```{r}
+confusionMatrix.train(rf_model)
+```
+
+-   最优参数预测的混淆矩阵.
+
+```{r}
+confusionMatrix(data = predict(rf_model, train), reference = train$class)
+```
+
+-   变量重要性
+
+这里按照降序排列前若干个重要变量
+
+```{r}
+kable_var(rf_model, 6)
+```
+
+这里按照降序绘制前若干个重要变量
+
+```{r}
+ggplot_var(rf_model, 6)
+```
+
+排名前六的变量分别是`aridity`、`im`、`aat0`、`pa`、`slope`、`aat10`
+
+-   partial dependence plots
+
+> [!Info]  
+> 二维图形
+
+```{r}
+pdp_2d_one_predictor(model = rf_model, num = 6, ncol = 2)
+```
+
+> [!Info]
+> 联合变量二维平面图形
+
+```{r}
+# pdp_2d_two_predictor(model = rf_model,num = 6,ncol = 3)
+```
+
+颜色越浅，数值越大。
+
+-   预测测试集
+
+```{r}
+extractProb(list(rf_model), testX = test) %>%
+  metrics_set(data = .) %>%
+  kable("html", align = "cr", escape = FALSE) %>%
+  kable_styling() %>%
+  kableExtra::kable_classic()
+```
+
+-   预测上海市
+
+```{r}
+sh_pred_layer <- pred_df(model = rf_model) %>%
+  pred_layer(
+    pred_df = .,
+    model = rf_model,
+    model.name = "rf"
+  )
+sh_pred_layer
+```
+
+结果是符合我们要求的
+
+-   上海市预测结果平面图
+
+```{r}
+sh_tmap(sh_pred_layer)
+```
+
+-   上海市预测结果立体图
+
+```{r}
+sh_rayshader(data = sh_pred_layer$rf_prob)
+```
+
+
+### 3.3 GBM
+
+-   10折交叉验证，3次重复
+
+Create control function for training with 10 folds and keep 3 folds for training. search method is grid.
+
+```{r}
+control <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 3,
+  search = "grid",
+  savePredictions = TRUE,
+  classProbs = TRUE
+)
+set.seed(1111)
+
+grid <- expand.grid(
+  interaction.depth = c(1, 3, 5),
+  n.trees = (0:50) * 50,
+  shrinkage = c(0.01, 0.001),
+  n.minobsinnode = 10
+)
+
+gbm_model <- train(class ~ .,
+  data = train,
+  # distribution = "binomial",
+  # family = "binomial",
+  method = "gbm",
+  trControl = control,
+  verbose = FALSE,
+  tuneGrid = grid,
+  metric = "Kappa",
+  bag.fraction = 0.75
+)
+gbm_model %>% summary()
+```
+
+-   输出`Kappa`达到最大的模型参数
+
+```{r}
+gbm_model$bestTune %>%
+  kable()
+```
+
+-   输出模型评价指标
+
+> [!Info]
+> 输出`acc`、`kappa`、`ROC`、`ppv`等指标
+
+```{r}
+metric_table(gbm_model) %>%
+  beautify_metric_table(table = .)
+```
+
+-   混淆矩阵
+
+10折交叉验证并且重复三次的结果如下(因为是平均所以会有非整数)
+
+```{r}
+confusionMatrix.train(gbm_model)
+```
+
+-   最优参数预测的混淆矩阵.
+
+```{r}
+confusionMatrix(data = predict(gbm_model, train), reference = train$class)
+```
+
+-   变量重要性
+
+这里按照降序排列前若干个重要变量
+
+```{r}
+kable_var(gbm_model, 6)
+```
+
+这里按照降序绘制前若干个重要变量
+
+```{r}
+ggplot_var(gbm_model, 6)
+```
+
+排名前六的变量分别是`aridity`、`im`、`aat0`、`pa`、`slope`、`aat10`
+
+-   partial dependence plots
+
+> [!Info]
+> 二维图形
+
+```{r}
+pdp_2d_one_predictor(model = gbm_model, num = 6, ncol = 2)
+```
+
+> [!Info]
+> 联合变量二维平面图形
+
+```{r}
+# pdp_2d_two_predictor(model = gbm_model,num = 6,ncol = 3)
+```
+
+颜色越浅，数值越大。
+
+-   预测测试集
+
+```{r}
+extractProb(list(gbm_model), testX = test) %>%
+  metrics_set(data = .) %>%
+  kable("html", align = "cr", escape = FALSE) %>%
+  kable_styling() %>%
+  kableExtra::kable_classic()
+```
+
+-   预测上海市
+
+```{r}
+sh_pred_layer <- pred_df(model = gbm_model) %>%
+  pred_layer(
+    pred_df = .,
+    model = gbm_model,
+    model.name = "gbm"
+  )
+sh_pred_layer
+```
+
+
+-   上海市预测结果平面图
+
+```{r}
+sh_tmap(sh_pred_layer)
+```
+
+-   上海市预测结果立体图
+
+```{r}
+sh_rayshader(data = sh_pred_layer$gbm_prob)
+```
+
+### 3.4 GLM
+
+使用`binomial`分布
+
+-   10折交叉验证，3次重复
+
+```{r}
+set.seed(1111)
+
+glm_model <- train(class ~ .,
+  data = train,
+  # family = "binomial",
+  method = "glm",
+  trControl = control,
+  # verbose=FALSE,
+  metric = "Kappa"
+)
+glm_model
+```
+
+-   输出`Kappa`达到最大的模型参数
+
+```{r}
+glm_model$bestTune %>%
+  kable()
+```
+
+-   输出模型评价指标
+
+> [!Info]
+> 输出`acc`、`kappa`、`ROC`、`ppv`等指标
+
+```{r}
+metric_table(glm_model) %>%
+  beautify_metric_table(table = .)
+```
+
+-   混淆矩阵
+
+10折交叉验证并且重复三次的结果如下(因为是平均所以会有非整数)
+
+```{r}
+confusionMatrix.train(glm_model)
+```
+
+-   最优参数预测的混淆矩阵.
+
+```{r}
+confusionMatrix(data = predict(glm_model, train), reference = train$class)
+```
+
+-   变量重要性
+
+这里按照降序排列前若干个重要变量
+
+```{r}
+kable_var(glm_model, 6)
+```
+
+这里按照降序绘制前若干个重要变量
+
+```{r}
+ggplot_var(glm_model, 6)
+```
+
+排名前六的变量分别是`aridity`、`im`、`aat0`、`pa`、`slope`、`aat10`
+
+-   partial dependence plots
+
+> [!Info]
+> 二维图形
+
+```{r}
+pdp_2d_one_predictor(model = glm_model, num = 6, ncol = 2)
+```
+
+> [!Info]
+> 联合变量二维平面图形
+
+```{r}
+# pdp_2d_two_predictor(model = glm_model,num = 6,ncol = 3)
+```
+
+颜色越浅，数值越大。
+
+-   预测测试集
+
+```{r}
+extractProb(list(glm_model), testX = test) %>%
+  metrics_set(data = .) %>%
+  kable("html", align = "cr", escape = FALSE) %>%
+  kable_styling() %>%
+  kableExtra::kable_classic()
+```
+
+-   预测上海市
+
+```{r}
+sh_pred_layer <- pred_df(model = glm_model) %>%
+  pred_layer(
+    pred_df = .,
+    model = glm_model,
+    model.name = "glm"
+  )
+sh_pred_layer
+```
+
+
+-   上海市预测结果平面图
+
+```{r}
+sh_tmap(sh_pred_layer)
+```
+
+-   上海市预测结果立体图
+
+```{r}
+sh_rayshader(data = sh_pred_layer$glm_prob)
+```
+
+
+### 3.5 NB
+
+-   10折交叉验证，3次重复
+
+```{r}
+set.seed(1111)
+
+nb_model <- train(class ~ .,
+  data = train,
+  # family = "binomial",
+  method = "naive_bayes",
+  trControl = control,
+  # verbose=FALSE,
+  metric = "Kappa"
+)
+nb_model
+```
+
+-   输出`Kappa`达到最大的模型参数
+
+```{r}
+nb_model$bestTune %>%
+  kable()
+```
+
+-   输出模型评价指标
+
+> [!Info]
+> 输出`acc`、`kappa`、`ROC`、`ppv`等指标
+
+```{r}
+metric_table(nb_model) %>%
+  beautify_metric_table(table = .)
+```
+
+-   混淆矩阵
+
+10折交叉验证并且重复三次的结果如下(因为是平均所以会有非整数)
+
+```{r}
+confusionMatrix.train(nb_model)
+```
+
+-   最优参数预测的混淆矩阵.
+
+```{r}
+confusionMatrix(data = predict(nb_model, train), reference = train$class)
+```
+
+-   变量重要性
+
+这里按照降序排列前若干个重要变量
+
+```{r}
+kable_var(nb_model, 6)
+```
+
+这里按照降序绘制前若干个重要变量
+
+```{r}
+ggplot_var(nb_model, 6)
+```
+
+排名前六的变量分别是`aridity`、`im`、`aat0`、`pa`、`slope`、`aat10`
+
+-   partial dependence plots
+
+> [!Info]
+> 二维图形
+
+```{r}
+pdp_2d_one_predictor(model = nb_model, num = 6, ncol = 2)
+```
+
+> [!Info]
+> 联合变量二维平面图形
+
+```{r}
+# pdp_2d_two_predictor(model = nb_model,num = 6,ncol = 3)
+```
+
+颜色越浅，数值越大。
+
+-   预测测试集
+
+```{r}
+extractProb(list(nb_model), testX = test) %>%
+  metrics_set(data = .) %>%
+  kable("html", align = "cr", escape = FALSE) %>%
+  kable_styling() %>%
+  kableExtra::kable_classic()
+```
+
+-   预测上海市
+
+```{r}
+sh_pred_layer <- pred_df(model = nb_model) %>%
+  pred_layer(
+    pred_df = .,
+    model = nb_model,
+    model.name = "nb"
+  )
+sh_pred_layer
+```
+
+
+-   上海市预测结果平面图
+
+```{r}
+sh_tmap(sh_pred_layer)
+```
+
+-   上海市预测结果立体图
+
+```{r}
+sh_rayshader(data = sh_pred_layer$nb_prob)
+```
+
+
+
+### 3.6 KNN
+
+-   10折交叉验证，3次重复
+
+```{r}
+set.seed(1111)
+
+knn_model <- train(class ~ .,
+  data = train,
+  method = "knn",
+  trControl = control,
+  metric = "Kappa"
+)
+knn_model
+```
+
+-   输出`Kappa`达到最大的模型参数
+
+```{r}
+knn_model$bestTune %>%
+  kable()
+```
+
+-   输出模型评价指标
+
+> [!Info]
+> 输出`acc`、`kappa`、`ROC`、`ppv`等指标
+
+```{r}
+metric_table(knn_model) %>%
+  beautify_metric_table(table = .)
+```
+
+-   混淆矩阵
+
+10折交叉验证并且重复三次的结果如下(因为是平均所以会有非整数)
+
+```{r}
+confusionMatrix.train(knn_model)
+```
+
+-   最优参数预测的混淆矩阵.
+
+```{r}
+# confusionMatrix(data = predict(knn_model,train),reference = train$class)
+```
+
+-   变量重要性
+
+这里按照降序排列前若干个重要变量
+
+```{r}
+kable_var(knn_model, 6)
+```
+
+这里按照降序绘制前若干个重要变量
+
+```{r}
+ggplot_var(knn_model, 6)
+```
+
+排名前六的变量分别是`im`、`pa`、`aridity`、`ndvi20162`、`ndvi20163`、`ndvi20164`
+
+-   partial dependence plots
+
+> [!Info]
+> 二维图形
+
+```{r}
+pdp_2d_one_predictor(model = knn_model, num = 6, ncol = 2)
+```
+
+> [!Info]
+> 联合变量二维平面图形
+
+```{r}
+# pdp_2d_two_predictor(model = knn_model,num = 6,ncol = 3)
+```
+
+颜色越浅，数值越大。
+
+-   预测测试集
+
+```{r}
+extractProb(list(knn_model), testX = test) %>%
+  metrics_set(data = .) %>%
+  kable("html", align = "cr", escape = FALSE) %>%
+  kable_styling() %>%
+  kableExtra::kable_classic()
+```
+
+-   预测上海市
+
+```{r}
+sh_pred_layer <- pred_df(model = knn_model) %>%
+  pred_layer(
+    pred_df = .,
+    model = knn_model,
+    model.name = "knn"
+  )
+sh_pred_layer
+```
+
+-   上海市预测结果平面图
+
+```{r}
+sh_tmap(sh_pred_layer)
+```
+
+-   上海市预测结果立体图
+
+```{r}
+sh_rayshader(data = sh_pred_layer$knn_prob)
+```
+
+
+
+### 3.7 C5.0
+
+-   10折交叉验证，3次重复
+
+```{r}
+set.seed(1111)
+
+grid <- expand.grid(.winnow = c(TRUE, FALSE), .trials = c(1, 5, 10, 15, 20), .model = "tree")
+
+C5.0_model <- train(class ~ .,
+  data = train,
+  tuneGrid = grid,
+  method = "C5.0",
+  trControl = control,
+  metric = "Kappa"
+)
+# C5.0_model %>% summary()
+```
+
+-   输出`Kappa`达到最大的模型参数
+
+```{r}
+C5.0_model$bestTune %>%
+  kable()
+```
+
+-   输出模型评价指标
+
+> [!Info]
+> 输出`acc`、`kappa`、`ROC`、`ppv`等指标
+
+```{r}
+metric_table(C5.0_model) %>%
+  beautify_metric_table(table = .)
+```
+
+-   混淆矩阵
+
+10折交叉验证并且重复三次的结果如下(因为是平均所以会有非整数)
+
+```{r}
+confusionMatrix.train(C5.0_model)
+```
+
+-   最优参数预测的混淆矩阵.
+
+```{r}
+# confusionMatrix(data = predict(C5.0_model,train),reference = train$class)
+```
+
+-   变量重要性
+
+这里按照降序排列前若干个重要变量
+
+```{r}
+kable_var(C5.0_model, 6)
+```
+
+这里按照降序绘制前若干个重要变量
+
+```{r}
+ggplot_var(C5.0_model, 6)
+```
+
+排名前六的变量分别是`ndvi20163`、`ndvi20162`、`im`、`dst_waterway`、`aridity`、`aat10`
+
+-   partial dependence plots
+
+> [!Info]
+> 二维图形
+
+```{r}
+pdp_2d_one_predictor(model = C5.0_model, num = 6, ncol = 2)
+```
+
+> [!Info]
+> 联合变量二维平面图形
+
+```{r}
+# pdp_2d_two_predictor(model = C5.0_model,num = 6,ncol = 3)
+```
+
+颜色越浅，数值越大。
+
+-   预测测试集
+
+```{r}
+extractProb(list(C5.0_model), testX = test) %>%
+  metrics_set(data = .) %>%
+  kable("html", align = "cr", escape = FALSE) %>%
+  kable_styling() %>%
+  kableExtra::kable_classic()
+```
+
+-   预测上海市
+
+```{r}
+sh_pred_layer <- pred_df(model = C5.0_model) %>%
+  pred_layer(
+    pred_df = .,
+    model = C5.0_model,
+    model.name = "C5.0"
+  )
+sh_pred_layer
+```
+
+
+-   上海市预测结果平面图
+
+```{r}
+sh_tmap(sh_pred_layer)
+```
+
+-   上海市预测结果立体图
+
+```{r}
+sh_rayshader(data = sh_pred_layer$C5.0_prob)
+```
+
+
+### 3.8 AdaBoost.M1
+
+-   10折交叉验证，3次重复
+
+```{r}
+set.seed(1111)
+grid <- expand.grid(
+  mfinal = (1:3) * 3,
+  maxdepth = c(1, 3),
+  coeflearn = c("Breiman", "Freund", "Zhu")
+)
+AdaBoost.M1_model <- train(class ~ .,
+  data = train,
+  tuneGrid = grid,
+  method = "AdaBoost.M1",
+  trControl = control,
+  preProc = c("center", "scale"),
+  metric = "Kappa"
+)
+# AdaBoost.M1_model %>% summary()
+```
+
+-   输出`Kappa`达到最大的模型参数
+
+```{r}
+AdaBoost.M1_model$bestTune %>%
+  kable()
+```
+
+-   输出模型评价指标
+
+> [!Info]
+> 输出`acc`、`kappa`、`ROC`、`ppv`等指标
+
+```{r}
+metric_table(AdaBoost.M1_model) %>%
+  beautify_metric_table(table = .)
+```
+
+-   混淆矩阵
+
+10折交叉验证并且重复三次的结果如下(因为是平均所以会有非整数)
+
+```{r}
+confusionMatrix.train(AdaBoost.M1_model)
+```
+
+-   最优参数预测的混淆矩阵.
+
+```{r}
+confusionMatrix(data = predict(AdaBoost.M1_model, train), reference = train$class)
+```
+
+-   变量重要性
+
+这里按照降序排列前若干个重要变量
+
+```{r}
+kable_var(AdaBoost.M1_model, 6)
+```
+
+这里按照降序绘制前若干个重要变量
+
+```{r}
+ggplot_var(AdaBoost.M1_model, 6)
+```
+
+排名前六的变量分别是`aridity`、`im`、`aat0`、`pa`、`slope`、`aat10`
+
+-   partial dependence plots
+
+> [!Info]
+> 二维图形
+
+```{r}
+pdp_2d_one_predictor(model = AdaBoost.M1_model, num = 6, ncol = 2)
+```
+
+> [!Info]
+> 联合变量二维平面图形
+
+```{r}
+# pdp_2d_two_predictor(model = AdaBoost.M1_model,num = 6,ncol = 3)
+```
+
+颜色越浅，数值越大。
+
+-   预测测试集
+
+```{r}
+extractProb(list(AdaBoost.M1_model), testX = test) %>%
+  metrics_set(data = .) %>%
+  kable("html", align = "cr", escape = FALSE) %>%
+  kable_styling() %>%
+  kableExtra::kable_classic()
+```
+
+-   预测上海市
+
+```{r}
+sh_pred_layer <- pred_df(model = AdaBoost.M1_model) %>%
+  pred_layer(
+    pred_df = .,
+    model = AdaBoost.M1_model,
+    model.name = "AdaBoost.M1"
+  )
+sh_pred_layer
+```
+
+-   上海市预测结果平面图
+
+```{r}
+sh_tmap(sh_pred_layer)
+```
+
+-   上海市预测结果立体图
+
+```{r}
+sh_rayshader(data = sh_pred_layer$AdaBoost.M1_prob)
+```
+
+
+
+### 3.9 XGB
+
+-   10折交叉验证，3次重复
+
+```{r}
+library(doParallel)
+cores <- makeCluster(detectCores() - 1)
+registerDoParallel(cores = cores)
+
+set.seed(123)
+
+grid_default <- expand.grid(
+  nrounds = 100,
+  max_depth = 6,
+  eta = 0.3,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+# Create control function for training with 10 folds and keep 3 folds for training. search method is grid.
+control <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 3,
+  savePredictions = TRUE,
+  classProbs = TRUE,
+  allowParallel = TRUE
+)
+
+xgb_model <- train(class ~ .,
+  data = train,
+  method = "xgbTree",
+  trControl = control,
+  tuneGrid = grid_default
+)
+xgb_model
+```
+
+-   输出`Kappa`达到最大的模型参数
+
+```{r}
+xgb_model$bestTune %>%
+  kable()
+```
+
+-   输出模型评价指标
+
+> [!Info]
+> 输出`acc`、`kappa`、`ROC`、`ppv`等指标
+
+```{r}
+metric_table(xgb_model) %>%
+  beautify_metric_table(table = .)
+```
+
+-   混淆矩阵
+
+10折交叉验证并且重复三次的结果如下(因为是平均所以会有非整数)
+
+```{r}
+confusionMatrix.train(xgb_model)
+```
+
+-   最优参数预测的混淆矩阵.
+
+```{r}
+confusionMatrix(data = predict(xgb_model, train), reference = train$class)
+```
+
+-   变量重要性
+
+这里按照降序排列前若干个重要变量
+
+```{r}
+kable_var(xgb_model, 6)
+```
+
+
+```{r}
+ggplot_var(xgb_model, 6)
+```
+
+排名前六的变量分别是`aridity`、`im`、`aat0`、`pa`、`slope`、`aat10`
+
+-   partial dependence plots
+
+> [!Info]
+> 二维图形
+
+```{r}
+pdp_2d_one_predictor(model = xgb_model, num = 6, ncol = 2)
+```
+
+> [!Info]
+> 联合变量二维平面图形
+
+```{r}
+pdp_2d_two_predictor(model = xgb_model, num = 6, ncol = 3)
+```
+
+颜色越浅，数值越大。
+
+-   预测测试集
+
+```{r}
+extractProb(list(xgb_model), testX = test) %>%
+  metrics_set(data = .) %>%
+  kable("html", align = "cr", escape = FALSE) %>%
+  kable_styling() %>%
+  kableExtra::kable_classic()
+```
+
+
+-   预测上海市
+
+```{r}
+sh_pred_layer <- pred_df(model = xgb_model) %>%
+  pred_layer(
+    pred_df = .,
+    model = xgb_model,
+    model.name = "xgb"
+  )
+sh_pred_layer
+```
+
+
+-   上海市预测结果平面图
+
+```{r}
+sh_tmap(sh_pred_layer)
+```
+
+-   上海市预测结果立体图
+
+```{r}
+sh_rayshader(data = sh_pred_layer$xgb_prob)
+```
+
+
+## 4. 结果汇总
+
+
+```{r}
+metrics_summary_test <- ls() %>%
+  as_tibble() %>%
+  setNames("model.name") %>%
+  dplyr::filter(str_detect(model.name, "_model")) %>%
+  # dplyr::filter(! model.name %in% c("J48_model","nb_model")) %>%
+  group_by(model.name) %>%
+  mutate(model = list(get(model.name))) %>%
+  mutate(metric = map(model, ~ extractProb(list(.x), testX = test) %>%
+    metrics_set(data = .))) %>%
+  dplyr::select(-model) %>%
+  unnest(metric) %>%
+  ungroup()
+```
+
+由于表格限制，只展示广义线性模型指标结果
+
+```{r}
+metrics_summary_test %>%
+  dplyr::filter(model.name == "glm_model") %>%
+  kable("html", align = "cr", escape = FALSE) %>%
+  kable_styling() %>%
+  kableExtra::kable_classic()
+```
+
+
+```{r}
+metrics_summary_test %>%
+  dplyr::filter(metric %in% c("kap", "roc", "tss")) %>%
+  group_by(metric) %>%
+  slice_max(value) %>%
+  ungroup()
+```
+
+- 同时汇总模型在训练集上的指标
+
+```{r}
+metrics_summary_train <- ls() %>%
+  as_tibble() %>%
+  setNames("model.name") %>%
+  dplyr::filter(str_detect(model.name, "_model")) %>%
+  group_by(model.name) %>%
+  mutate(model = list(get(model.name))) %>%
+  mutate(metric = map(model, ~ extractProb(list(.x), testX = train) %>%
+    metrics_set(data = .))) %>%
+  dplyr::select(-model) %>%
+  unnest(metric) %>%
+  ungroup()
+metrics_summary_train %>%
+  dplyr::filter(metric %in% c("kap", "roc", "tss")) %>%
+  group_by(metric) %>%
+  slice_max(value)
+```
+
+一时间竟然无法取舍
+
+### 4.1  最优模型变量重要性
+
+```{r}
+metrics_summary_test %>%
+  dplyr::filter(metric %in% c("kap", "roc", "tss")) %>%
+  group_by(metric) %>%
+  slice_max(value) %>%
+  ungroup() %>%
+  dplyr::distinct(.keep_all = T, model.name) %>%
+  dplyr::select(model.name) %>%
+  group_by(model.name) %>%
+  mutate(vip = map(model.name, ~ caret::varImp(get(model.name)) %>%
+    .$importance %>%
+    dplyr::select(last_col()) %>%
+    rownames_to_column("variables") %>%
+    setNames(c("variables", "importance")) %>%
+    arrange(desc(importance)))) %>%
+  unnest(vip) %>%
+  ungroup() %>%
+  kable("html", escape = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  kableExtra::kable_classic()
+```
+
+- 用一个横向表格对比各种结果中不同变量重要性
+
+```{r}
+metrics_summary_test %>%
+  dplyr::filter(metric %in% c("kap", "roc", "tss")) %>%
+  group_by(metric) %>%
+  slice_max(value) %>%
+  ungroup() %>%
+  dplyr::distinct(.keep_all = T, model.name) %>%
+  dplyr::select(model.name) %>%
+  group_by(model.name) %>%
+  mutate(vip = map(model.name, ~ caret::varImp(get(model.name)) %>%
+    .$importance %>%
+    dplyr::select(last_col()) %>%
+    rownames_to_column("variables") %>%
+    setNames(c("variables", "importance")) %>%
+    arrange(desc(importance)))) %>%
+  unnest(vip) %>%
+  mutate(rank = 1:n()) %>%
+  ungroup() %>%
+  dplyr::select(model.name, variables, rank) %>%
+  pivot_wider(names_from = model.name, values_from = rank)
+```
+
+### 4.2 提升曲线
+
+```{r,eval =FALSE}
+lift.df <- ls() %>%
+  as_tibble() %>%
+  setNames("model.name") %>%
+  dplyr::filter(str_detect(model.name, "_model")) %>%
+  group_by(model.name) %>%
+  mutate(model = list(get(model.name))) %>%
+  mutate(pred = map(model, ~ extractProb(list(.x), testX = train) %>%
+    dplyr::select(X0))) %>%
+  dplyr::select(-model) %>%
+  unnest(pred) %>%
+  ungroup() %>%
+  setNames(c("model", "prob")) %>%
+  # 辅助列帮助转成tibble而非list
+  # mutate(id = rep(1:nrow(train),10)) %>%
+  mutate(across(.cols = model, .fns = function(x) str_remove(x, "_model"))) %>%
+  pivot_wider(names_from = model, values_from = prob) %>%
+  mutate(Class = train$class) %>%
+  dplyr::select(-id)
+```
+
+- 根据上文生成的表格计算`lift curve`
+
+```{r,eval=FALSE}
+lift_obj <- lift(x = Class ~ AdaBoost.M1 + C5.0 + gbm + glm + J48 + knn + nb + rf + svm + xgb, data = lift.df)
+
+ggplot(data = lift_obj, plot = "gain") +
+  theme_bw()
+```
+
+看起来差别不大，因此不考虑使用提升曲线
+
+```{r,eval=FALSE}
+lift.plot <- ls() %>%
+  as_tibble() %>%
+  setNames("model.name") %>%
+  dplyr::filter(str_detect(model.name, "_model")) %>%
+  dplyr::filter(!model.name %in% c("J48_model")) %>%
+  group_by(model.name) %>%
+  mutate(model = list(get(model.name))) %>%
+  mutate(train.pred = map(.x = model, .f = function(x) {
+    train %>%
+      mutate(pred = predict(object = x, newdata = train, type = "prob")[, "X1"]) %>%
+      mutate(class = ifelse(class == "X0", 0, 1))
+  })) %>%
+  mutate(test.pred = map(.x = model, .f = function(x) {
+    test %>%
+      mutate(pred = predict(object = x, newdata = test, type = "prob")[, "X1"]) %>%
+      mutate(class = ifelse(class == "X0", 0, 1))
+  })) %>%
+  mutate(plot = pmap(.l = list(train.pred, test.pred, model.name), .f = function(x, y, z) {
+    lift_plot(train_pred = x, test_pred = y, target = "class", score = "pred") +
+      ggtitle(label = paste(z %>%
+        str_remove("_model") %>%
+        toupper(), "Lift Chart", sep = " ")) +
+      theme(
+        plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+        text = element_text(size = 10, hjust = 0.5, family = "CAL"),
+        axis.title.y = element_text(face = "bold", hjust = 0.5),
+        axis.title.x = element_text(face = "bold", hjust = 0.5),
+        axis.text.x = element_text(size = 8, face = "bold", family = "CAL", hjust = 0.5, vjust = 0.5),
+        axis.text.y = element_text(size = 8, face = "bold", family = "CAL", hjust = 0.5, vjust = 0.5)
+      )
+  }))
+
+# do.call(grid.arrange,c(lift.plot$plot,ncol = 5))
+marrangeGrob(lift.plot$plot, nrow = 1, ncol = 1, npages = length(lift.plot$plot))
+```
+
+
+### 4.3 ks曲线
+
+```{r}
+ks.plot <- ls() %>%
+  as_tibble() %>%
+  setNames("model.name") %>%
+  dplyr::filter(str_detect(model.name, "_model")) %>%
+  dplyr::filter(!model.name %in% c("J48_model")) %>%
+  group_by(model.name) %>%
+  mutate(model = list(get(model.name))) %>%
+  mutate(train.pred = map(.x = model, .f = function(x) {
+    train %>%
+      mutate(pred = predict(object = x, newdata = train, type = "prob")[, "X1"]) %>%
+      mutate(class = ifelse(class == "X0", 0, 1))
+  })) %>%
+  mutate(test.pred = map(.x = model, .f = function(x) {
+    test %>%
+      mutate(pred = predict(object = x, newdata = test, type = "prob")[, "X1"]) %>%
+      mutate(class = ifelse(class == "X0", 0, 1))
+  })) %>%
+  mutate(plot = pmap(.l = list(train.pred, test.pred, model.name), .f = function(x, y, z) {
+    ks_plot(train_pred = x, test_pred = y, target = "class", score = "pred") +
+      ggtitle(label = paste(z %>%
+        str_remove("_model") %>%
+        toupper(), "K-S Curve", sep = " ")) +
+      theme(
+        plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+        text = element_text(size = 10, hjust = 0.5, family = "CAL"),
+        axis.title.y = element_text(face = "bold", hjust = 0.5),
+        axis.title.x = element_text(face = "bold", hjust = 0.5),
+        axis.text.x = element_text(size = 8, face = "bold", family = "CAL", hjust = 0.5, vjust = 0.5),
+        axis.text.y = element_text(size = 8, face = "bold", family = "CAL", hjust = 0.5, vjust = 0.5)
+      )
+  }))
+
+# do.call(grid.arrange,c(ks.plot$plot,ncol = 5))
+marrangeGrob(ks.plot$plot, nrow = 1, ncol = 1, npages = length(ks.plot$plot))
+```
+
+
+### 4.4 roc曲线
+
+```{r}
+roc.plot <- ls() %>%
+  as_tibble() %>%
+  setNames("model.name") %>%
+  dplyr::filter(str_detect(model.name, "_model")) %>%
+  dplyr::filter(!model.name %in% c("J48_model")) %>%
+  group_by(model.name) %>%
+  mutate(model = list(get(model.name))) %>%
+  mutate(train.pred = map(.x = model, .f = function(x) {
+    train %>%
+      mutate(pred = predict(object = x, newdata = train, type = "prob")[, "X1"]) %>%
+      mutate(class = ifelse(class == "X0", 0, 1))
+  })) %>%
+  mutate(test.pred = map(.x = model, .f = function(x) {
+    test %>%
+      mutate(pred = predict(object = x, newdata = test, type = "prob")[, "X1"]) %>%
+      mutate(class = ifelse(class == "X0", 0, 1))
+  })) %>%
+  mutate(plot = pmap(.l = list(train.pred, test.pred, model.name), .f = function(x, y, z) {
+    roc_plot(train_pred = x, test_pred = y, target = "class", score = "pred") +
+      ggtitle(label = paste(z %>%
+        str_remove("_model") %>%
+        toupper(), "ROC Curve", sep = " ")) +
+      theme(
+        plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+        text = element_text(size = 10, hjust = 0.5, family = "CAL"),
+        axis.title.y = element_text(face = "bold", hjust = 0.5),
+        axis.title.x = element_text(face = "bold", hjust = 0.5),
+        axis.text.x = element_text(size = 8, face = "bold", family = "CAL", hjust = 0.5, vjust = 0.5),
+        axis.text.y = element_text(size = 8, face = "bold", family = "CAL", hjust = 0.5, vjust = 0.5)
+      )
+  }))
+
+# do.call(grid.arrange,c(roc.plot$plot,ncol = 5))
+marrangeGrob(roc.plot$plot, nrow = 1, ncol = 1, npages = length(roc.plot$plot))
+```
+
+
+### 4.5 Precision recall curve
+
+```{r}
+pr.plot <- ls() %>%
+  as_tibble() %>%
+  setNames("model.name") %>%
+  dplyr::filter(str_detect(model.name, "_model")) %>%
+  dplyr::filter(!model.name %in% c("J48_model")) %>%
+  group_by(model.name) %>%
+  mutate(model = list(get(model.name))) %>%
+  mutate(train.pred = map(.x = model, .f = function(x) {
+    train %>%
+      bind_cols(predict(object = x, newdata = train, type = "prob") %>%
+        as_tibble())
+  })) %>%
+  mutate(test.pred = map(.x = model, .f = function(x) {
+    test %>%
+      bind_cols(predict(object = x, newdata = test, type = "prob") %>%
+        as_tibble())
+  })) %>%
+  mutate(plot = pmap(.l = list(train.pred, test.pred, model.name), .f = function(x, y, z) {
+    pr_curve(x, class, X0) %>%
+      ggplot(aes(x = recall, y = precision)) +
+      geom_path() +
+      coord_equal() +
+      ggtitle(label = paste(z %>%
+        str_remove("_model") %>%
+        toupper(), "Precision recall curve", sep = " ")) +
+      theme(
+        plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+        text = element_text(size = 10, hjust = 0.5, family = "CAL"),
+        axis.title.y = element_text(face = "bold", hjust = 0.5),
+        axis.title.x = element_text(face = "bold", hjust = 0.5),
+        axis.text.x = element_text(size = 8, face = "bold", family = "CAL", hjust = 0.5, vjust = 0.5),
+        axis.text.y = element_text(size = 8, face = "bold", family = "CAL", hjust = 0.5, vjust = 0.5)
+      )
+  }))
+
+# do.call(grid.arrange,c(pr.plot$plot,ncol = 5))
+marrangeGrob(pr.plot$plot, nrow = 1, ncol = 1, npages = length(pr.plot$plot))
+```
+
+
+### 4.6 Gain curve
+
+```{r}
+gain.plot <- ls() %>%
+  as_tibble() %>%
+  setNames("model.name") %>%
+  dplyr::filter(str_detect(model.name, "_model")) %>%
+  dplyr::filter(!model.name %in% c("J48_model")) %>%
+  group_by(model.name) %>%
+  mutate(model = list(get(model.name))) %>%
+  mutate(train.pred = map(.x = model, .f = function(x) {
+    train %>%
+      bind_cols(predict(object = x, newdata = train, type = "prob") %>%
+        as_tibble())
+  })) %>%
+  mutate(test.pred = map(.x = model, .f = function(x) {
+    test %>%
+      bind_cols(predict(object = x, newdata = test, type = "prob") %>%
+        as_tibble())
+  })) %>%
+  mutate(plot = pmap(.l = list(train.pred, test.pred, model.name), .f = function(x, y, z) {
+    gain_curve(x, class, X0) %>%
+      autoplot() +
+      ggtitle(label = paste(z %>%
+        str_remove("_model") %>%
+        toupper(), "Gain curve", sep = " ")) +
+      theme(
+        plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+        text = element_text(size = 10, hjust = 0.5, family = "CAL"),
+        axis.title.y = element_text(face = "bold", hjust = 0.5),
+        axis.title.x = element_text(face = "bold", hjust = 0.5),
+        axis.text.x = element_text(size = 8, face = "bold", family = "CAL", hjust = 0.5, vjust = 0.5),
+        axis.text.y = element_text(size = 8, face = "bold", family = "CAL", hjust = 0.5, vjust = 0.5)
+      )
+  }))
+
+# do.call(grid.arrange,c(gain.plot$plot,ncol = 5))
+marrangeGrob(gain.plot$plot, nrow = 1, ncol = 1, npages = length(gain.plot$plot))
+```
+
+
+### 4.7 概率分布图
+
+```{r}
+score.distribution.plot <- ls() %>%
+  as_tibble() %>%
+  setNames("model.name") %>%
+  dplyr::filter(str_detect(model.name, "_model")) %>%
+  dplyr::filter(!model.name %in% c("J48_model")) %>%
+  group_by(model.name) %>%
+  mutate(model = list(get(model.name))) %>%
+  mutate(train.pred = map(.x = model, .f = function(x) {
+    train %>%
+      mutate(pred = predict(object = x, newdata = train, type = "prob")[, "X1"]) %>%
+      mutate(class = ifelse(class == "X0", 0, 1))
+  })) %>%
+  mutate(test.pred = map(.x = model, .f = function(x) {
+    test %>%
+      mutate(pred = predict(object = x, newdata = test, type = "prob")[, "X1"]) %>%
+      mutate(class = ifelse(class == "X0", 0, 1))
+  })) %>%
+  mutate(plot = pmap(.l = list(train.pred, test.pred, model.name), .f = function(x, y, z) {
+    score_distribution_plot(train_pred = x, test_pred = y, target = "class", score = "pred") +
+      ggtitle(label = paste(z %>%
+        str_remove("_model") %>%
+        toupper(), "Population Distribution", sep = " ")) +
+      theme(
+        plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+        text = element_text(size = 10, hjust = 0.5, family = "CAL"),
+        axis.title.y = element_text(face = "bold", hjust = 0.5),
+        axis.title.x = element_text(face = "bold", hjust = 0.5),
+        axis.text.x = element_text(size = 8, face = "bold", family = "CAL", hjust = 0.5, vjust = 0.5),
+        axis.text.y = element_text(size = 8, face = "bold", family = "CAL", hjust = 0.5, vjust = 0.5)
+      )
+  }))
+
+# do.call(grid.arrange,c(score.distribution.plot$plot,ncol = 5))
+marrangeGrob(score.distribution.plot$plot, nrow = 1, ncol = 1, npages = length(score.distribution.plot$plot))
+```
+
+- 表格形式展示信息
+
+```{r}
+ls() %>%
+  as_tibble() %>%
+  setNames("model.name") %>%
+  dplyr::filter(str_detect(model.name, "_model")) %>%
+  dplyr::filter(!model.name %in% c("J48_model")) %>%
+  group_by(model.name) %>%
+  mutate(model = list(get(model.name))) %>%
+  mutate(train.pred = map(.x = model, .f = function(x) {
+    train %>%
+      mutate(pred = predict(object = x, newdata = train, type = "prob")[, "X1"]) %>%
+      mutate(class = ifelse(class == "X0", 0, 1))
+  })) %>%
+  mutate(test.pred = map(.x = model, .f = function(x) {
+    test %>%
+      mutate(pred = predict(object = x, newdata = test, type = "prob")[, "X1"]) %>%
+      mutate(class = ifelse(class == "X0", 0, 1))
+  })) %>%
+  mutate(perf.tab = pmap(.l = list(train.pred, test.pred, model.name), .f = function(x, y, z) {
+    perf_table(train_pred = x, test_pred = y, target = "class", score = "pred") %>%
+      mutate(bins = str_sub(bins, 4, nchar(bins))) %>%
+      mutate(group = 1:n()) %>%
+      mutate(model = z) %>%
+      dplyr::select(model, group, everything())
+  })) %>%
+  dplyr::select(perf.tab) %>%
+  unnest(perf.tab)
+```
+
+
+- 响应概率曲线
+
+下面这个概率相应曲线看起来是没问题的，但是经过后期和`biomod2`包所跑结果比对，这个结果是不靠谱的。排查原因的话，是和数据没关系的<s>我利用`caret`和`randomForest`两个包所跑的随机森林模型对统一数据进行预测，发现预测概率结果是不同的</s>。万般无奈之下，我选择在先挑选出最优模型之后使用其他包`biomod2`以及`sdm`来跑这些模型
+
+```{r}
+rf_model %>%
+  .$coefnames %>%
+  as_tibble()
+
+ls() %>%
+  as_tibble() %>%
+  setNames("model.name") %>%
+  dplyr::filter(str_detect(model.name, "_model")) %>%
+  # dplyr::filter(! model.name %in% c("J48_model","nb_model")) %>%
+  group_by(model.name) %>%
+  mutate(model = list(get(model.name))) %>%
+  mutate(expl.name = map(model, ~ .x$coefnames %>% as_tibble()))
+
+varImp(rf_model) %>%
+  .$importance %>%
+  rownames_to_column("expl.name") %>%
+  as_tibble() %>%
+  setNames(c("expl.name", "importance")) %>%
+  arrange(desc(importance)) %>%
+  dplyr::select(expl.name)
+
+
+a <- varImp(rf_model) %>%
+  .$importance %>%
+  rownames_to_column("expl.name") %>%
+  as_tibble() %>%
+  setNames(c("expl.name", "importance")) %>%
+  arrange(desc(importance)) %>%
+  dplyr::select(expl.name) %>%
+  mutate(model = list(rf_model)) %>%
+  # 生成模型列
+  mutate(train.data = list(train)) %>%
+  # 对指定变量之外变量进行处理
+  mutate(train.processed = map2(expl.name, train.data, .f = function(x, y) {
+    y %>%
+      dplyr::select(-class) %>%
+      # 对17个自变量做取均值/中位数等处理
+      mutate(across(.cols = -x, .fns = mean)) %>%
+      # 对目标自变量等间距拉伸
+      mutate(across(.cols = x, .fns = function(x) {
+        tmp <- seq(from = min(x), max(x), length.out = length(x))
+        return(tmp)
+      }))
+  })) %>%
+  # 使用模型预测
+  mutate(prob = pmap(.l = list(model, train.processed, expl.name), .f = function(x, y, z) {
+    predict(object = x, newdata = y, type = "prob") %>%
+      dplyr::select(X1) %>%
+      setNames("prob") %>%
+      bind_cols(y %>%
+        dplyr::select(z) %>%
+        setNames("value"))
+  }))
+myrp <- a %>%
+  dplyr::select(-model, -train.data, -train.processed) %>%
+  mutate(plot = map2(.x = prob, .y = expl.name, .f = function(x, y) {
+    ggplot(data = x, aes(value, prob)) +
+      geom_line() +
+      geom_point(size = 1, alpha = 1 / 5) +
+      geom_smooth() +
+      ggtitle(paste(y)) +
+      theme_light() +
+      scale_x_continuous(n.breaks = 7) +
+      scale_y_continuous(labels = function(x) paste0(x * 100, "%")) +
+      # labs(x = "Environmental factor",
+      # y = "Probability of existance") +
+      theme(
+        plot.title = element_text(size = 14, hjust = 0.5),
+        # text = element_text(size = 12,hjust = 0.5,family = "CAL"),
+        axis.title.y = element_text(size = 14, hjust = 0.5, family = "CAL"),
+        axis.title.x = element_text(size = 14, hjust = 0.5, family = "CAL"),
+        axis.text.x = element_text(size = 13, family = "RMN", hjust = 0.5, vjust = 0.5),
+        axis.text.y = element_text(size = 13, family = "RMN", hjust = 0.5, vjust = 0.5),
+        strip.text = element_text(size = 14, family = "CAL")
+      )
+  }))
+# do.call(grid.arrange,c(myrp$plot,ncol = 6))
+marrangeGrob(myrp$plot, nrow = 1, ncol = 1, npages = length(myrp$plot))
+```

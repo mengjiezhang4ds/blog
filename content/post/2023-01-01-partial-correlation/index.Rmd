@@ -1,0 +1,138 @@
+---
+title: "栅格数据偏相关分析"
+author: "学R不思则罔"
+date: '2023-01-05'
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+categories: ["R"]
+tags: ["dplyr", "terra","ggplot2"]
+description: "使用terra包对栅格数据进行逐项元偏相关分析"
+toc: true
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## 0.西海情歌
+
+```{r}
+library(embedr)
+audio <- "西海情歌.mp3"
+embed_audio(audio, attribute = c("controls"))
+```
+
+
+
+```{r message=FALSE,warning=FALSE}
+library(terra)
+library(tidyverse)
+library(tidyterra)
+```
+
+## 1.无缺失值情况
+
+### 1.1 生成数据
+
+```{r}
+sos <- rast(array(runif(10 * 10 * 20), c(10, 10, 20)))
+tem <- rast(array(runif(10 * 10 * 20), c(10, 10, 20)))
+pre <- rast(array(runif(10 * 10 * 20), c(10, 10, 20)))
+NDVI <- rast(array(runif(10 * 10 * 20), c(10, 10, 20)))
+z <- c(NDVI, tem, pre)
+```
+
+### 1.2 编写函数
+
+```{r}
+fun_cor <- function(x) {
+  Rs <- ppcor::pcor.test(x[1:20], x[21:40], x[41:60])
+  Rx <- Rs$estimate
+  Px <- Rs$p.value
+  return(c(Rx, Px))
+}
+pc_res <- app(z, fun_cor, cores = 4)
+pc_res
+```
+
+### 1.3 结果可视化
+
+```{r}
+plot(pc_res)
+```
+
+## 2.存在缺失值情况
+
+### 2.1 生成数据
+
+```{r}
+ndvi <- rast(array(runif(10 * 10 * 20), c(10, 10, 20)))
+names(ndvi) <- paste0("ndvi", 1:20)
+sos <- rast(array(runif(10 * 10 * 20), c(10, 10, 20)))
+names(sos) <- paste0("sos", 1:20)
+tem <- rast(array(runif(10 * 10 * 20), c(10, 10, 20)))
+names(tem) <- paste0("tem", 1:20)
+ssd <- rast(array(runif(10 * 10 * 20), c(10, 10, 20)))
+names(ssd) <- paste0("ssd", 1:20)
+pre <- rast(array(runif(10 * 10 * 20), c(10, 10, 20)))
+names(pre) <- paste0("pre", 1:20)
+# 合并数据
+all_data <- c(ndvi, sos, tem, ssd, pre)
+all_data
+```
+
+### 2.2 编写函数
+
+```{r}
+func_pcor <- function(x) {
+  temp_ndvi <- x[1:20]
+  temp_sos <- x[21:40]
+  temp_tem <- x[41:60]
+  temp_ssd <- x[61:80]
+  temp_pre <- x[81:100]
+
+  temp_data <- data.frame(cbind(temp_ndvi, temp_sos, temp_tem, temp_ssd, temp_pre))
+
+  if (is.na(sum(temp_data))) {
+    return(c(NA, NA, NA, NA, NA, NA, NA, NA))
+  } else {
+    corValue <- ppcor::pcor(temp_data)
+    # 相关系数
+    cor_pre <- corValue$estimate[1, 2]
+    cor_tem <- corValue$estimate[1, 3]
+    cor_rhu <- corValue$estimate[1, 4]
+    cor_ssd <- corValue$estimate[1, 5]
+    # 显著性
+    pvalue_pre <- corValue$p.value[1, 2]
+    pvalue_tem <- corValue$p.value[1, 3]
+    pvalue_rhu <- corValue$p.value[1, 4]
+    pvalue_ssd <- corValue$p.value[1, 5]
+
+    print(c(cor_pre, cor_tem, cor_rhu, cor_ssd))
+    return(c(cor_pre, pvalue_pre, cor_tem, pvalue_tem, cor_rhu, pvalue_rhu, cor_ssd, pvalue_ssd))
+  }
+}
+pc_res <- terra::app(all_data, func_pcor, cores = 8)
+# names(pc_res) = c("pre","pre_pvalue", "tem","tem_pvalue","rhu","rhu_pvalue","ssd","ssd_pvalue")
+```
+
+### 2.3 结果可视化
+
+```{r}
+plot(pc_res)
+```
+
+### 2.4 结果保存删除
+
+```{r}
+writeRaster(pc_res, "pc_res.tif", overwrite = TRUE)
+rast("pc_res.tif") %>% plot()
+file.remove("pc_res.tif")
+```
+
+
+---

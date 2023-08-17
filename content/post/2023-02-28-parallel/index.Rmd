@@ -1,0 +1,343 @@
+---
+title: "parallel之初体验"
+author: "学R不思则罔"
+date: '2023-02-28'
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+categories: ["R"]
+tags: ["dplyr","parallel"]
+description: "使用parallel扩展包进行对矩阵进行多线程运算，代码中很多地方还略显粗糙，后期有待优化"
+toc: true
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## 1.准备工作
+
+### 1.1 加载扩展包
+
+```{r message=FALSE,warning=FALSE}
+rm(list = ls())
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(parallel)
+```
+
+### 1.2 加载扩展包
+
+```{r message=FALSE,warning=FALSE}
+load("Y.RData")
+load("X.RData")
+load("Missing.RData")
+TT <- 36
+T <- NROW(X)
+N <- NCOL(X)
+```
+
+
+### 1.3 启用多线程
+
+```{r message=FALSE,warning=FALSE}
+cores <- detectCores(logical = FALSE)
+cl <- makeCluster(cores)
+```
+
+### 1.4 编写多线程函数
+
+```{r message=FALSE,warning=FALSE}
+EM_estV2 <- function(Yt = tempY, Z1 = tempX, Z2 = tempX, missing = tempMissing) {
+  Tz <- NROW(Z1)
+  N <- NCOL(Z1)
+  K1 <- if (length(dim(Z1)) > 2) dim(Z1)[3] else 1
+  K2 <- if (length(dim(Z2)) > 2) dim(Z2)[3] else 1
+  
+  # set.seed(123)
+  BT <- matrix(rnorm(Tz * (K1 + 1)), nrow = Tz)
+  BT_fixT <- matrix(rnorm(Tz * (K1 + 1)), nrow = Tz)
+  BN <- matrix(rnorm(N * ((N - 1) * K2)), nrow = N)
+  
+  list(BN = BN, BT = BT, BT_fixT = BT_fixT)
+}
+
+squeezefun <- function(tmp) {
+  dimres <- dim(tmp)
+  filter <- which(dimres != 1)
+  if (length(filter) == 2) {
+    matrix(tmp, dimres[filter[1]], dimres[filter[2]])
+  } else if (length(filter) == 1) {
+    if (filter[1] == 2) {
+      matrix(tmp, 1, dimres[filter[1]])
+    } else {
+      matrix(tmp, dimres[filter[1]], 1)
+    }
+  } else {
+    tmp
+  }
+}
+```
+
+### 1.5 编写核心函数
+
+```{r message=FALSE,warning=FALSE}
+clusterExport(cl,varlist = c("X","Y","Missing",
+                             "TT","T","N","squeezefun","EM_estV2"))
+
+# 定义函数以提取信息
+fill_tidy <- function(j) {
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  # 声明变量
+  # TT <- 36
+  # T <- NROW(X)
+  # N <- NCOL(X)
+  # 数据产生
+  Twindow <- (j - TT):(j)
+  tempX <- X[Twindow, , ]
+  tempY <- Y[Twindow, ]
+  tempMissing <- Missing[Twindow, ]
+  
+  DeleteI <- which(apply(tempMissing, 2, sum) > 1 / 3 * length(Twindow)) ## %delete individuals with more than 30% missing values
+  
+  dim_X <- dim(X)
+  rm(Twindow,Missing,Y,X)
+  
+  if (length(DeleteI) == 0) {
+    DeleteI <- dim(tempMissing)[2] + 1
+  }
+  tempMissing <- tempMissing[, -DeleteI]
+  tempY <- tempY[, -DeleteI]
+  tempX <- tempX[, -DeleteI, ]
+  # MissingT <- apply(tempMissing, 1, sum)
+  
+  Ntemp <- dim(tempY)[2]
+  DeleteT <- which(apply(tempMissing, 1, sum) > 1 / 3 * Ntemp) ## %delete individuals with more than 30% missing values
+  
+  if (length(DeleteT) == 0) {
+    DeleteT <- length(apply(tempMissing, 1, sum)) + 1
+  }
+  
+  DeleteT <- c(DeleteT, 61)
+  DeleteT <- DeleteT[!duplicated(DeleteT)]
+  DeleteT <- DeleteT[-which(DeleteT == 61)]
+  tempMissingF <- tempMissing[-DeleteT, ]
+  tempYF <- tempY[-DeleteT, ]
+  tempXF <- tempX[-DeleteT, , ]
+  
+  lt <- dim(tempYF)[1]
+  tempMissing <- tempMissingF[-lt, ]
+  tempY <- tempYF[-lt, ]
+  tempX <- tempXF[-lt, , ]
+  
+  rm(tempYF,tempMissingF)
+  
+  if (dim(tempY)[1] < 24) {
+    next
+  }
+  
+  result <- EM_estV2(tempY, tempX, tempX, tempMissing)
+  tempBT <- result$BT
+  tempBT_fixT <- result$BT_fixT
+  tempBN <- result$BN
+  
+  rm(result)
+  
+  avegBT <- apply(tempBT[(TT - 4):TT, ], 2, mean)
+  avegBT_fixT <- apply(tempBT_fixT[(TT - 4):TT, ], 2, mean)
+  Nt <- dim(tempXF)[2]
+  
+  res <- setdiff(1:118, DeleteI) %>%
+    as_tibble() %>%
+    setNames("column") %>%
+    mutate(group = 1:n()) %>%
+    group_by(group) %>%
+    mutate(Y = map(.x = group, .f = function(x) {
+      ifelse(length(dim_X) > 2,
+             sum(avegBT * c(1, as.vector(squeezefun(tempXF[lt, x, ])))),
+             sum(avegBT * c(1, (tempXF[lt, x, ])))
+      )
+    })) %>%
+    mutate(Y_fixT = map(.x = group, .f = function(x) {
+      ifelse(length(dim_X) > 2,
+             sum(avegBT_fixT * c(1, as.vector(squeezefun(tempXF[lt, x, ])))),
+             sum(avegBT_fixT * c(1, (tempXF[lt, x, ])))
+      )
+    })) %>%
+    mutate(Xi = map(.x = group, .f = function(x) {
+      Xi <- t(tempXF[lt, , ]) %>%
+        .[, -x] %>%
+        t()
+      Xi <- matrix(Xi, NROW(Xi) * NCOL(Xi), 1)
+      Xi[is.na(Xi)] <- 0
+      Xi
+    })) %>%
+    mutate(tempBN = map(.x = group, .f = function(x) {
+      tempBN[x, ][is.na(tempBN[x, ])] <- 0
+      tempBN
+    })) %>%
+    mutate(Y_p = pmap(list(group, Xi, tempBN), .f = function(x, y, z) {
+      z[x, ] %*% y
+    })) %>%
+    mutate(Y_new = map2(.x = Y, .y = Y_p, .f = function(x, y) {
+      x + y
+    })) %>%
+    mutate(Y_fixT_p = pmap(list(group, Xi, tempBN), .f = function(x, y, z) {
+      z[x, ] %*% y
+    })) %>%
+    mutate(Y_fixT_new = map2(.x = Y_fixT, .y = Y_fixT_p, .f = function(x, y) {
+      x + y
+    })) %>%
+    dplyr::select(column, Y, Y_p, Y_new, Y_fixT, Y_fixT_p, Y_fixT_new) %>%
+    mutate(t = j) %>%
+    unnest(cols = c(Y, Y_p, Y_new, Y_fixT, Y_fixT_p, Y_fixT_new)) %>%
+    ungroup() %>%
+    mutate(Y, Y_fixT, Y_p = Y_p[, 1], Y_fixT_p = Y_fixT_p[, 1], Y_new = Y_new[, 1], Y_fixT_new = Y_fixT_new[, 1]) %>%
+    dplyr::select(t, column, Y_new, Y_fixT_new) %>%
+    setNames(c("r", "c", "Y", "Y_fixT"))
+  
+  return(res)
+}
+```
+
+
+## 2.多线程计算
+
+```{r message=FALSE,warning=FALSE}
+system.time({
+  res <- parLapply(cl, (TT + 1):T, fill_tidy)
+})
+stopCluster(cl)
+head(res)
+```
+
+## 3.结果展示
+
+```{r message=FALSE,warning=FALSE}
+head(rlist::list.rbind(res))
+```
+
+
+```{r message=FALSE,warning=FALSE}
+# 根据行列数转矩阵
+rc2df <- function(r, c) {
+  result <- data.frame(
+    r = rep(1:r, c),
+    c = rep(1:c, each = r)
+  )
+  return(result)
+}
+lasso_hat_Y <- rc2df(r = T, c = N) %>%
+  left_join(rlist::list.rbind(res)) %>%
+  dplyr::arrange(c, r) %>%
+  pull(Y) %>%
+  matrix(data = ., nrow = T, ncol = N)
+```
+
+
+```{r message=FALSE,warning=FALSE}
+lasso_hat_Y_fixT <- rc2df(r = T, c = N) %>%
+  left_join(rlist::list.rbind(res)) %>%
+  dplyr::arrange(c, r) %>%
+  pull(Y_fixT) %>%
+  matrix(data = ., nrow = T, ncol = N)
+```
+
+- 最终结果
+
+```{r message=FALSE,warning=FALSE}
+head(lasso_hat_Y)
+```
+
+
+```{r message=FALSE,warning=FALSE}
+head(lasso_hat_Y_fixT)
+```
+
+## 4.结果验证
+
+```{r message=FALSE,warning=FALSE}
+# 根据行列数转矩阵
+lasso_hat_Y <- rc2df(r = T, c = N) %>%
+  left_join(rlist::list.rbind(res)) %>%
+  dplyr::arrange(c, r) %>%
+  pull(Y) %>%
+  matrix(data = ., nrow = T, ncol = N)
+```
+
+
+```{r message=FALSE,warning=FALSE}
+lasso_hat_Y_fixT <- rc2df(r = T, c = N) %>%
+  left_join(rlist::list.rbind(res)) %>%
+  dplyr::arrange(c, r) %>%
+  pull(Y_fixT) %>%
+  matrix(data = ., nrow = T, ncol = N)
+```
+
+
+```{r message=FALSE,warning=FALSE}
+multi_threading_lasso_hat_Y <- lasso_hat_Y
+multi_threading_lasso_hat_Y_fixT <- lasso_hat_Y_fixT
+```
+
+
+```{r message=FALSE,warning=FALSE}
+# 比较数据
+m2df <- function(data) {
+  result <- data.frame(
+    r = rep(1:nrow(data), ncol(data)),
+    c = rep(1:ncol(data), each = nrow(data)),
+    value = as.vector(data)
+  )
+  return(result)
+}
+```
+
+
+```{r message=FALSE,warning=FALSE}
+single_thread_lasso_hat_Y <- lasso_hat_Y
+single_thread_lasso_hat_Y_fixT <- lasso_hat_Y_fixT
+```
+
+
+```{r message=FALSE,warning=FALSE}
+# 结果相同记做0
+tibble(
+  x = as.vector(single_thread_lasso_hat_Y),
+  y = as.vector(multi_threading_lasso_hat_Y)
+) %>%
+  mutate(res = case_when(
+    is.na(x) == TRUE & is.na(y) == TRUE ~ 0,
+    x == y ~ 0,
+    TRUE ~ 1
+  )) %>%
+  pull(res) %>%
+  table()
+```
+
+
+```{r message=FALSE,warning=FALSE}
+tibble(
+  x = as.vector(single_thread_lasso_hat_Y_fixT),
+  y = as.vector(multi_threading_lasso_hat_Y_fixT)
+) %>%
+  mutate(res = case_when(
+    is.na(x) == TRUE & is.na(y) == TRUE ~ 0,
+    x == y ~ 0,
+    x - y == 0 ~ 0,
+    TRUE ~ 1
+  )) %>%
+  pull(res) %>%
+  table()
+```
+
+**结果是对得上的**
+
+
+-------------

@@ -1,0 +1,88 @@
+---
+title: "标准化降水蒸散指数(SPEI)计算"
+author: "学R不思则罔"
+date: '2023-06-02'
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+thumbnail: "thumbnail.png"
+categories: ["R"]
+tags: ["snow", "nc","spei"]
+description: "基于1901年到2022年的潜在蒸散量数据和降水量数据，使用**spei**函数多线程计算spei指数，输入和输出格式都以nc格式保存，提供nc转txt格式接口"
+toc: true
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## 1.加载扩展包
+
+Compute SPEI at various time scales from very large netCDF files, using parallel computing. The resulting netCDF files are stored  to disk on directory './outputNcdf/'.
+
+```{r message=FALSE,warning=FALSE}
+if (!require('pacman')) install.packages('pacman')
+pacman::p_load(ncdf4, snowfall, parallel, Hmisc, devtools)
+```
+
+Using SPEI package version 1.8.0. Please, note that this will replace any
+ other version of the SPEI package that you might have installed!
+
+```{r message=FALSE,warning=FALSE,eval=FALSE}
+devtools::install_github('sbegueria/SPEI@v1.8.0')
+```
+
+## 2.加载函数
+
+ A function to efficiently compute the SPEI over a large netCDF file (using multiple cores).
+
+```{r}
+source('./R/functions.R')
+spei.nc
+```
+
+
+Initialize a parallel computing cluster; modify the parameter `cpus` to the desired number of cores; otherwise, it will use all available cores.
+
+```{r}
+sfInit(parallel=TRUE, cpus=detectCores())
+sfExport(list='spei', namespace='SPEI')
+```
+
+
+## 3.计算spei
+
+Compute SPEI at all time scales between 1 and 48 and store to disk.
+
+```{r,eval=FALSE}
+for (i in c(1,3)) {#  for (i in c(1:48)) {
+    spei.nc(
+      sca=i,
+		  inPre='./inputData/cru_ts4.07.1901.2022.pre.dat.nc',
+		  inEtp='./inputData/cru_ts4.07.1901.2022.pet.dat.nc',
+		  outFile=paste('./outputNcdf/spei',
+		              formatC(i, width=2, format='d', flag='0'),'.nc',sep=''),
+		  title=paste('Global ',i,'-month',
+		            ifelse(i==1,'','s'),' SPEI, z-values, 0.5 degree',sep=''),
+		  comment='Using CRU TS 4.07 precipitation and potential evapotranspiration data',
+	    	  version='2.9.0',
+		  block=36,
+		  inMask=NA,
+		  tlapse=NA
+	  )
+  gc()
+}
+# Stop the parallel cluster
+sfStop()
+```
+
+
+
+## 参考文献
+
+1.[Standardized Precipitation Evapotranspiration Index (SPEI)](https://climatedataguide.ucar.edu/climate-data/standardized-precipitation-evapotranspiration-index-spei)
+
+---------------------

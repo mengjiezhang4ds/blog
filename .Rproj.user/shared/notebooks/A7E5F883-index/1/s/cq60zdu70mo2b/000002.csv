@@ -1,0 +1,4 @@
+"0","if (!require('pacman')) install.packages('pacman')"
+"2","载入需要的程辑包：pacman
+"
+"0","pacman::p_load(ncdf4, snowfall, parallel, Hmisc, devtools)"

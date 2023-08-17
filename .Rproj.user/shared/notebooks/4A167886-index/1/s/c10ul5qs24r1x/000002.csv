@@ -1,0 +1,42 @@
+"0","library(predicts)"
+"2","载入需要的程辑包：terra
+"
+"2","terra 1.7.29
+"
+"2","
+载入程辑包：‘terra’
+
+"
+"2","The following objects are masked from ‘package:spatialEco’:
+
+    shift, sieve
+
+"
+"2","
+载入程辑包：‘predicts’
+
+"
+"2","The following object is masked from ‘package:sp’:
+
+    geometry
+
+"
+"0","library(raster)"
+"0","library(ggplot2)"
+"0","library(terra)"
+"0","library(tidyterra)"
+"2","
+载入程辑包：‘tidyterra’
+
+"
+"2","The following object is masked from ‘package:raster’:
+
+    select
+
+"
+"2","The following object is masked from ‘package:stats’:
+
+    filter
+
+"
+"0","library(Kendall)"
